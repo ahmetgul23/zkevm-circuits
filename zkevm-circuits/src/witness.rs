@@ -36,3 +36,5 @@ mod l1_msg;
 mod tx;
 
 pub use tx::Transaction;
+
+mod zstd;
