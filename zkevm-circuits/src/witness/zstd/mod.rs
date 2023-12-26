@@ -10,6 +10,7 @@ pub use types::*;
 mod util;
 use util::value_bits_le;
 
+/// MagicNumber
 fn process_magic_number<F: Field>(
     src: &[u8],
     byte_offset: usize,
@@ -80,6 +81,7 @@ fn process_magic_number<F: Field>(
     )
 }
 
+/// FrameHeaderDescriptor and FrameContentSize
 fn process_frame_header<F: Field>(
     src: &[u8],
     byte_offset: usize,
@@ -88,9 +90,8 @@ fn process_frame_header<F: Field>(
 ) -> (usize, Vec<ZstdWitnessRow<F>>) {
     let fhd_byte = src
         .get(byte_offset)
-        .expect("FrameHeaderDescriptor byte should exist")
-        .clone();
-    let value_bits = value_bits_le(fhd_byte);
+        .expect("FrameHeaderDescriptor byte should exist");
+    let value_bits = value_bits_le(*fhd_byte);
 
     assert_eq!(value_bits[0], 0, "dictionary ID should not exist");
     assert_eq!(value_bits[1], 0, "dictionary ID should not exist");
@@ -100,7 +101,7 @@ fn process_frame_header<F: Field>(
     assert_eq!(value_bits[5], 1, "single segment expected");
 
     let fhd_value_rlc =
-        last_row.encoded_data.value_rlc * randomness + Value::known(F::from(fhd_byte as u64));
+        last_row.encoded_data.value_rlc * randomness + Value::known(F::from(*fhd_byte as u64));
 
     // the number of bytes taken to represent FrameContentSize.
     let fcs_tag_len: usize = match value_bits[7] * 2 + value_bits[6] {
@@ -108,7 +109,7 @@ fn process_frame_header<F: Field>(
         1 => 2,
         2 => 4,
         3 => 8,
-        _ => unreachable!(),
+        _ => unreachable!("2-bit value"),
     };
 
     // FrameContentSize bytes are read in little-endian, hence its in reverse mode.
@@ -147,8 +148,7 @@ fn process_frame_header<F: Field>(
         .collect::<Vec<Value<F>>>();
     let aux_1 = fcs_value_rlcs
         .last()
-        .expect("FrameContentSize bytes expected")
-        .clone();
+        .expect("FrameContentSize bytes expected");
     let aux_2 = fhd_value_rlc;
 
     (
@@ -161,13 +161,13 @@ fn process_frame_header<F: Field>(
                 tag_next: ZstdTag::FrameContentSize,
                 tag_len: 1,
                 tag_idx: 1,
-                tag_value: Value::known(F::from(fhd_byte as u64)),
-                tag_value_acc: Value::known(F::from(fhd_byte as u64)),
+                tag_value: Value::known(F::from(*fhd_byte as u64)),
+                tag_value_acc: Value::known(F::from(*fhd_byte as u64)),
             },
             encoded_data: EncodedData {
                 byte_idx: (byte_offset + 1) as u64,
                 encoded_len: last_row.encoded_data.encoded_len,
-                value_byte: fhd_byte,
+                value_byte: *fhd_byte,
                 value_rlc: fhd_value_rlc,
                 ..Default::default()
             },
@@ -206,7 +206,7 @@ fn process_frame_header<F: Field>(
                             reverse: true,
                             reverse_idx: (fcs_tag_len - i) as u64,
                             reverse_len: fcs_tag_len as u64,
-                            aux_1,
+                            aux_1: *aux_1,
                             aux_2,
                             value_rlc,
                         },
@@ -220,15 +220,294 @@ fn process_frame_header<F: Field>(
     )
 }
 
-fn process_block_header<F: Field>() -> (usize, Vec<ZstdWitnessRow<F>>) {
-    unimplemented!();
+fn process_block<F: Field>(
+    src: &[u8],
+    byte_offset: usize,
+    last_row: &ZstdWitnessRow<F>,
+    randomness: Value<F>,
+) -> (usize, Vec<ZstdWitnessRow<F>>, bool) {
+    let mut witness_rows = vec![];
+
+    let (byte_offset, rows, last_block, block_type, block_size) =
+        process_block_header(src, byte_offset, last_row, randomness);
+    witness_rows.extend_from_slice(&rows);
+
+    let last_row = rows.last().expect("last row expected to exist");
+    let (_byte_offset, rows) = match block_type {
+        BlockType::RawBlock => process_block_raw(
+            src,
+            byte_offset,
+            last_row,
+            randomness,
+            block_size,
+            last_block,
+        ),
+        BlockType::RleBlock => process_block_rle(
+            src,
+            byte_offset,
+            last_row,
+            randomness,
+            block_size,
+            last_block,
+        ),
+        BlockType::ZstdCompressedBlock => process_block_zstd(
+            src,
+            byte_offset,
+            last_row,
+            randomness,
+            block_size,
+            last_block,
+        ),
+        BlockType::Reserved => unreachable!("Reserved block type not expected"),
+    };
+    witness_rows.extend_from_slice(&rows);
+
+    (byte_offset, witness_rows, last_block)
 }
 
-fn process_block_raw<F: Field>() -> (usize, Vec<ZstdWitnessRow<F>>) {
-    unimplemented!();
+fn process_block_header<F: Field>(
+    src: &[u8],
+    byte_offset: usize,
+    last_row: &ZstdWitnessRow<F>,
+    randomness: Value<F>,
+) -> (usize, Vec<ZstdWitnessRow<F>>, bool, BlockType, usize) {
+    let bh_bytes = src
+        .iter()
+        .skip(byte_offset)
+        .take(N_BLOCK_HEADER_BYTES)
+        .cloned()
+        .collect::<Vec<u8>>();
+    let last_block = (bh_bytes[0] & 1) == 1;
+    let block_type = BlockType::from((bh_bytes[0] >> 1) & 3);
+    let block_size =
+        (bh_bytes[2] as usize * 256 * 256 + bh_bytes[1] as usize * 256 + bh_bytes[0] as usize) >> 3;
+
+    let tag_next = match block_type {
+        BlockType::RawBlock => ZstdTag::RawBlockBytes,
+        BlockType::RleBlock => ZstdTag::RleBlockBytes,
+        BlockType::ZstdCompressedBlock => ZstdTag::ZstdBlockLiteralsHeader,
+        _ => unreachable!("BlockType::Reserved unexpected"),
+    };
+
+    let tag_value_iter = bh_bytes.iter().scan(Value::known(F::zero()), |acc, &byte| {
+        *acc = *acc * randomness + Value::known(F::from(byte as u64));
+        Some(*acc)
+    });
+    let tag_value = tag_value_iter.clone().last().expect("BlockHeader expected");
+
+    // BlockHeader follows FrameContentSize which is processed in reverse order.
+    // Hence value_rlc at the first BlockHeader byte will be calculated as:
+    //
+    // value_rlc::cur == aux_1::prev * (rand ^ reverse_len) * rand
+    //      + aux_2::prev * rand
+    //      + value_byte::cur
+    let acc_start = last_row.encoded_data.aux_1
+        * randomness.map(|r| r.pow([last_row.encoded_data.reverse_len, 0, 0, 0]))
+        + last_row.encoded_data.aux_2;
+    let value_rlcs = bh_bytes
+        .iter()
+        .scan(acc_start, |acc, &byte| {
+            *acc = *acc * randomness + Value::known(F::from(byte as u64));
+            Some(*acc)
+        })
+        .collect::<Vec<Value<F>>>();
+
+    (
+        byte_offset + N_BLOCK_HEADER_BYTES,
+        bh_bytes
+            .iter()
+            .zip(tag_value_iter)
+            .zip(value_rlcs.iter())
+            .enumerate()
+            .map(
+                |(i, ((&value_byte, tag_value_acc), &value_rlc))| ZstdWitnessRow {
+                    instance_idx: last_row.instance_idx,
+                    frame_idx: last_row.frame_idx,
+                    state: ZstdState {
+                        tag: ZstdTag::BlockHeader,
+                        tag_next,
+                        tag_len: N_BLOCK_HEADER_BYTES as u64,
+                        tag_idx: (i + 1) as u64,
+                        tag_value,
+                        tag_value_acc,
+                    },
+                    encoded_data: EncodedData {
+                        byte_idx: (byte_offset + i + 1) as u64,
+                        encoded_len: last_row.encoded_data.encoded_len,
+                        value_byte,
+                        reverse: false,
+                        value_rlc,
+                        ..Default::default()
+                    },
+                    decoded_data: last_row.decoded_data.clone(),
+                    huffman_data: HuffmanData::default(),
+                    fse_data: FseData::default(),
+                },
+            )
+            .collect::<Vec<_>>(),
+        last_block,
+        block_type,
+        block_size,
+    )
 }
 
-fn process_block_rle<F: Field>() -> (usize, Vec<ZstdWitnessRow<F>>) {
+fn process_block_raw<F: Field>(
+    src: &[u8],
+    byte_offset: usize,
+    last_row: &ZstdWitnessRow<F>,
+    randomness: Value<F>,
+    block_size: usize,
+    last_block: bool,
+) -> (usize, Vec<ZstdWitnessRow<F>>) {
+    let value_rlc_iter = src.iter().skip(byte_offset).take(block_size).scan(
+        last_row.encoded_data.value_rlc,
+        |acc, &byte| {
+            *acc = *acc * randomness + Value::known(F::from(byte as u64));
+            Some(*acc)
+        },
+    );
+    let decoded_value_rlc_iter = src.iter().skip(byte_offset).take(block_size).scan(
+        last_row.decoded_data.decoded_value_rlc,
+        |acc, &byte| {
+            *acc = *acc * randomness + Value::known(F::from(byte as u64));
+            Some(*acc)
+        },
+    );
+    let tag_value_iter = src.iter().skip(byte_offset).take(block_size).scan(
+        Value::known(F::zero()),
+        |acc, &byte| {
+            *acc = *acc * randomness + Value::known(F::from(byte as u64));
+            Some(*acc)
+        },
+    );
+    let tag_value = tag_value_iter
+        .clone()
+        .last()
+        .expect("Raw bytes must be of non-zero length");
+    let tag_next = if last_block {
+        ZstdTag::Null
+    } else {
+        ZstdTag::BlockHeader
+    };
+
+    (
+        byte_offset + block_size,
+        src.iter()
+            .skip(byte_offset)
+            .take(block_size)
+            .zip(tag_value_iter)
+            .zip(value_rlc_iter)
+            .zip(decoded_value_rlc_iter)
+            .enumerate()
+            .map(
+                |(i, (((&value_byte, tag_value_acc), value_rlc), decoded_value_rlc))| {
+                    ZstdWitnessRow {
+                        instance_idx: last_row.instance_idx,
+                        frame_idx: last_row.frame_idx,
+                        state: ZstdState {
+                            tag: ZstdTag::RawBlockBytes,
+                            tag_next,
+                            tag_len: block_size as u64,
+                            tag_idx: (i + 1) as u64,
+                            tag_value,
+                            tag_value_acc,
+                        },
+                        encoded_data: EncodedData {
+                            byte_idx: (byte_offset + i + 1) as u64,
+                            encoded_len: last_row.encoded_data.encoded_len,
+                            value_byte,
+                            value_rlc,
+                            reverse: false,
+                            ..Default::default()
+                        },
+                        decoded_data: DecodedData {
+                            decoded_len: last_row.decoded_data.decoded_len,
+                            decoded_len_acc: last_row.decoded_data.decoded_len + (i as u64) + 1,
+                            total_decoded_len: last_row.decoded_data.total_decoded_len,
+                            decoded_byte: value_byte,
+                            decoded_value_rlc,
+                        },
+                        huffman_data: HuffmanData::default(),
+                        fse_data: FseData::default(),
+                    }
+                },
+            )
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn process_block_rle<F: Field>(
+    src: &[u8],
+    byte_offset: usize,
+    last_row: &ZstdWitnessRow<F>,
+    randomness: Value<F>,
+    block_size: usize,
+    last_block: bool,
+) -> (usize, Vec<ZstdWitnessRow<F>>) {
+    let rle_byte = src[byte_offset];
+    let value_rlc =
+        last_row.encoded_data.value_rlc * randomness + Value::known(F::from(rle_byte as u64));
+    let decoded_value_rlc_iter = std::iter::repeat(rle_byte).take(block_size).scan(
+        last_row.decoded_data.decoded_value_rlc,
+        |acc, byte| {
+            *acc = *acc * randomness + Value::known(F::from(byte as u64));
+            Some(*acc)
+        },
+    );
+    let tag_value = Value::known(F::from(rle_byte as u64));
+    let tag_next = if last_block {
+        ZstdTag::Null
+    } else {
+        ZstdTag::BlockHeader
+    };
+
+    (
+        byte_offset + 1,
+        std::iter::repeat(rle_byte)
+            .take(block_size)
+            .zip(decoded_value_rlc_iter)
+            .enumerate()
+            .map(|(i, (value_byte, decoded_value_rlc))| ZstdWitnessRow {
+                instance_idx: last_row.instance_idx,
+                frame_idx: last_row.frame_idx,
+                state: ZstdState {
+                    tag: ZstdTag::RleBlockBytes,
+                    tag_next,
+                    tag_len: block_size as u64,
+                    tag_idx: (i + 1) as u64,
+                    tag_value,
+                    tag_value_acc: tag_value,
+                },
+                encoded_data: EncodedData {
+                    byte_idx: (byte_offset + 1) as u64,
+                    encoded_len: last_row.encoded_data.encoded_len,
+                    value_byte,
+                    reverse: false,
+                    value_rlc,
+                    ..Default::default()
+                },
+                decoded_data: DecodedData {
+                    decoded_len: last_row.decoded_data.decoded_len,
+                    decoded_len_acc: last_row.decoded_data.decoded_len_acc + (i as u64) + 1,
+                    total_decoded_len: last_row.decoded_data.total_decoded_len,
+                    decoded_byte: value_byte,
+                    decoded_value_rlc,
+                },
+                huffman_data: HuffmanData::default(),
+                fse_data: FseData::default(),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn process_block_zstd<F: Field>(
+    src: &[u8],
+    byte_offset: usize,
+    last_row: &ZstdWitnessRow<F>,
+    randomness: Value<F>,
+    block_size: usize,
+    last_block: bool,
+) -> (usize, Vec<ZstdWitnessRow<F>>) {
     unimplemented!();
 }
 
@@ -252,30 +531,6 @@ fn process_block_zstd_lstream<F: Field>() -> (usize, Vec<ZstdWitnessRow<F>>) {
     unimplemented!();
 }
 
-fn process_block_zstd<F: Field>() -> (usize, Vec<ZstdWitnessRow<F>>) {
-    unimplemented!();
-}
-
-fn process_block<F: Field>(
-    src: &[u8],
-    byte_offset: usize,
-    last_row: &ZstdWitnessRow<F>,
-    randomness: Value<F>,
-) -> (usize, Vec<ZstdWitnessRow<F>>) {
-    let bh_bytes = src
-        .iter()
-        .skip(byte_offset)
-        .take(N_BLOCK_HEADER_BYTES)
-        .cloned()
-        .collect::<Vec<u8>>();
-    let last_block = bh_bytes[0] & 1;
-    let block_type = (bh_bytes[0] >> 1) & 3;
-    let block_size =
-        (bh_bytes[2] as u64 * 256 * 256 + bh_bytes[1] as u64 * 256 + bh_bytes[0] as u64) >> 3;
-
-    unimplemented!();
-}
-
 pub fn process<F: Field>(src: &[u8], randomness: Value<F>) -> Vec<ZstdWitnessRow<F>> {
     let mut witness_rows = vec![];
     let byte_offset = 0;
@@ -284,8 +539,7 @@ pub fn process<F: Field>(src: &[u8], randomness: Value<F>) -> Vec<ZstdWitnessRow
     // consists of a single frame.
     let find_magic_number = |haystack: &[u8], needle: &[u8], from_offset: usize| -> Option<usize> {
         (from_offset..haystack.len() - needle.len() + 1)
-            .filter(|&i| haystack[i..i + needle.len()] == needle[..])
-            .next()
+            .find(|&i| haystack[i..i + needle.len()] == needle[..])
     };
     assert_eq!(find_magic_number(src, &MAGIC_NUMBER_BYTES[..], 0), Some(0));
     assert_eq!(find_magic_number(src, &MAGIC_NUMBER_BYTES[..], 4), None);
@@ -309,7 +563,7 @@ pub fn process<F: Field>(src: &[u8], randomness: Value<F>) -> Vec<ZstdWitnessRow
     witness_rows.extend_from_slice(&rows);
 
     loop {
-        let (byte_offset, rows) = process_block::<F>(
+        let (byte_offset, rows, last_block) = process_block::<F>(
             src,
             byte_offset,
             rows.last().expect("last row expected to exist"),
@@ -317,7 +571,8 @@ pub fn process<F: Field>(src: &[u8], randomness: Value<F>) -> Vec<ZstdWitnessRow
         );
         witness_rows.extend_from_slice(&rows);
 
-        if byte_offset >= src.len() {
+        if last_block {
+            assert!(byte_offset >= src.len());
             break;
         }
     }

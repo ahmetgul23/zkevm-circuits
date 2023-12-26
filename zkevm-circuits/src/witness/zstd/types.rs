@@ -3,7 +3,26 @@ use halo2_proofs::circuit::Value;
 
 use super::{params::N_BITS_PER_BYTE, util::value_bits_le};
 
-#[derive(Clone, Debug)]
+pub enum BlockType {
+    RawBlock = 0,
+    RleBlock,
+    ZstdCompressedBlock,
+    Reserved,
+}
+
+impl From<u8> for BlockType {
+    fn from(src: u8) -> Self {
+        match src {
+            0 => Self::RawBlock,
+            1 => Self::RleBlock,
+            2 => Self::ZstdCompressedBlock,
+            3 => Self::Reserved,
+            _ => unreachable!("BlockType is 2 bits"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum ZstdTag {
     Null,
     MagicNumber,
