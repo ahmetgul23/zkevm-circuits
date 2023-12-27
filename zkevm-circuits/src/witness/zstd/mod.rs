@@ -7,6 +7,11 @@ pub use params::*;
 mod types;
 pub use types::*;
 
+#[cfg(test)]
+mod tui;
+#[cfg(test)]
+use tui::draw_rows;
+
 mod util;
 use util::value_bits_le;
 
@@ -576,6 +581,9 @@ pub fn process<F: Field>(src: &[u8], randomness: Value<F>) -> Vec<ZstdWitnessRow
             break;
         }
     }
+
+    #[cfg(test)]
+    let _ = draw_rows(&witness_rows);
 
     witness_rows
 }

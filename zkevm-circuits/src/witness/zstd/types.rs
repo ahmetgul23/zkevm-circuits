@@ -28,7 +28,6 @@ pub enum ZstdTag {
     MagicNumber,
     FrameHeaderDescriptor,
     FrameContentSize,
-    WindowDescriptor,
     BlockHeader,
     RawBlockBytes,
     RleBlockBytes,
@@ -40,6 +39,28 @@ pub enum ZstdTag {
     Lstream2,
     Lstream3,
     Lstream4,
+}
+
+impl ToString for ZstdTag {
+    fn to_string(&self) -> String {
+        String::from(match self {
+            Self::Null => "null",
+            Self::MagicNumber => "MagicNumber",
+            Self::FrameHeaderDescriptor => "FrameHeaderDescriptor",
+            Self::FrameContentSize => "FrameContentSize",
+            Self::BlockHeader => "BlockHeader",
+            Self::RawBlockBytes => "RawBlockBytes",
+            Self::RleBlockBytes => "RleBlockBytes",
+            Self::ZstdBlockLiteralsHeader => "ZstdBlockLiteralsHeader",
+            Self::ZstdBlockHuffmanHeader => "ZstdBlockHuffmanHeader",
+            Self::ZstdBlockHuffmanCode => "ZstdBlockHuffmanCode",
+            Self::ZstdBlockJumpTable => "ZstdBlockJumpTable",
+            Self::Lstream1 => "Lstream1",
+            Self::Lstream2 => "Lstream2",
+            Self::Lstream3 => "Lstream3",
+            Self::Lstream4 => "Lstream4",
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
