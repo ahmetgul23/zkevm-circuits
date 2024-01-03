@@ -49,6 +49,8 @@ use keccak256::plain::Keccak;
 use std::array;
 use strum_macros::{EnumCount, EnumIter};
 
+mod decompression;
+
 /// Trait used to define lookup tables
 pub trait LookupTable<F: Field> {
     /// Returns the list of ALL the table columns following the table order.

@@ -27,6 +27,7 @@ compile_error!("This program requires a 64-bit target architecture.");
 
 pub mod bytecode_circuit;
 pub mod copy_circuit;
+pub mod decompression_circuit;
 pub mod ecc_circuit;
 pub mod evm_circuit;
 pub mod exp_circuit;
