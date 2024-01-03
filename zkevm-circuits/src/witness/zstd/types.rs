@@ -1,7 +1,26 @@
 use eth_types::Field;
 use halo2_proofs::circuit::Value;
+use strum_macros::EnumIter;
 
 use super::{params::N_BITS_PER_BYTE, util::value_bits_le};
+
+#[derive(Clone, Copy, Debug, EnumIter)]
+pub enum FseSymbol {
+    S0 = 0,
+    S1,
+    S2,
+    S3,
+    S4,
+    S5,
+    S6,
+    S7,
+}
+
+impl From<FseSymbol> for usize {
+    fn from(value: FseSymbol) -> Self {
+        value as usize
+    }
+}
 
 pub enum BlockType {
     RawBlock = 0,
@@ -22,9 +41,9 @@ impl From<u8> for BlockType {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, EnumIter)]
 pub enum ZstdTag {
-    Null,
+    Null = 0,
     MagicNumber,
     FrameHeaderDescriptor,
     FrameContentSize,

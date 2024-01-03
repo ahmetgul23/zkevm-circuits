@@ -38,3 +38,4 @@ mod tx;
 pub use tx::Transaction;
 
 mod zstd;
+pub use zstd::FseSymbol;
