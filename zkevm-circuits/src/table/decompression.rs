@@ -1,21 +1,22 @@
 use array_init::array_init;
 use eth_types::Field;
-use gadgets::binary_number::{BinaryNumberChip, BinaryNumberConfig};
+use gadgets::{
+    binary_number::{BinaryNumberChip, BinaryNumberConfig},
+    is_equal::{IsEqualChip, IsEqualConfig},
+    util::{and, not, sum, Expr},
+};
 use halo2_proofs::{
     plonk::{Advice, Column, ConstraintSystem, Fixed},
     poly::Rotation,
 };
+use strum::IntoEnumIterator;
 
-use crate::{evm_circuit::util::constraint_builder::BaseConstraintBuilder, witness::FseSymbol};
+use crate::{
+    evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
+    witness::{FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS},
+};
 
-use super::LookupTable;
-
-/// Maximum number of symbols (weights), i.e. symbol in [0, N_MAX_SYMBOLS).
-pub const N_MAX_SYMBOLS: usize = 8;
-
-/// Number of bits used to represent the symbol in binary form. This will be used as a helper
-/// gadget to form equality constraints over the symbol's value.
-pub const N_BITS_SYMBOL: usize = 3;
+use super::{LookupTable, Pow2Table};
 
 /// The finite state entropy table in its default view, i.e. when the ``state`` increments.
 ///
@@ -214,9 +215,11 @@ impl<F: Field> LookupTable<F> for FseAuxiliaryTable {
 /// The Huffman codes table maps the canonical weights (symbols as per FseTable) to the Huffman
 /// codes.
 #[derive(Clone, Debug)]
-pub struct HuffmanCodesTable {
+pub struct HuffmanCodesTable<F> {
     /// Fixed column to denote whether the constraints will be enabled or not.
     pub q_enabled: Column<Fixed>,
+    /// Fixed column to mark the first row in the table.
+    pub q_first: Column<Fixed>,
     /// The encoded/decoded data's instance ID where this FSE table belongs.
     pub instance_idx: Column<Advice>,
     /// The frame's ID within the data instance where this FSE table belongs.
@@ -224,6 +227,8 @@ pub struct HuffmanCodesTable {
     /// The byte offset within the data instance where the encoded FSE table begins. This is
     /// 1-indexed, i.e. byte_offset == 1 at the first byte.
     pub byte_offset: Column<Advice>,
+    /// Helper gadget to know when we are done handling a single canonical Huffman code.
+    pub byte_offset_eq: IsEqualConfig<F>,
     /// The byte that is being encoded by a Huffman code.
     pub symbol: Column<Advice>,
     /// The weight assigned to this symbol as per the canonical Huffman code weights.
@@ -241,8 +246,6 @@ pub struct HuffmanCodesTable {
     /// The maximum length of a bitstring as per this Huffman code. Again, this value does not
     /// change over the rows for a specific Huffman code.
     pub max_bitstring_len: Column<Advice>,
-    /// The length of the bitstring encoding this symbol in the Huffman code.
-    pub bitstring_len: Column<Advice>,
     /// As per Huffman coding, every symbol is mapped to a bit value, which is then represented in
     /// binary form (padded) of length bitstring_len.
     pub bit_value: Column<Advice>,
@@ -250,15 +253,23 @@ pub struct HuffmanCodesTable {
     pub last_bit_values: [Column<Advice>; N_MAX_SYMBOLS],
 }
 
-impl HuffmanCodesTable {
-    pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
+impl<F: Field> HuffmanCodesTable<F> {
+    pub fn construct(meta: &mut ConstraintSystem<F>, pow2_table: Pow2Table) -> Self {
         let q_enabled = meta.fixed_column();
+        let byte_offset = meta.advice_column();
         let weight = meta.advice_column();
-        let huffman_table = Self {
+        let table = Self {
             q_enabled,
+            q_first: meta.fixed_column(),
             instance_idx: meta.advice_column(),
             frame_idx: meta.advice_column(),
-            byte_offset: meta.advice_column(),
+            byte_offset,
+            byte_offset_eq: IsEqualChip::configure(
+                meta,
+                |meta| meta.query_fixed(q_enabled, Rotation::cur()),
+                |meta| meta.query_advice(byte_offset, Rotation::cur()),
+                |meta| meta.query_advice(byte_offset, Rotation::next()),
+            ),
             symbol: meta.advice_column(),
             weight,
             weight_bits: BinaryNumberChip::configure(meta, q_enabled, Some(weight.into())),
@@ -266,21 +277,218 @@ impl HuffmanCodesTable {
             weight_acc: meta.advice_column(),
             sum_weights: meta.advice_column(),
             max_bitstring_len: meta.advice_column(),
-            bitstring_len: meta.advice_column(),
             bit_value: meta.advice_column(),
             last_bit_values: array_init(|_| meta.advice_column()),
         };
 
-        meta.create_gate("TODO", |meta| {
+        // TODO: We later wish to constrain the relation between last_bit_values[w] and
+        // last_bit_values[w+1] on the first and last rows of a particular Huffman code.
+        for col in table.last_bit_values {
+            meta.enable_equality(col);
+        }
+
+        // The first row of the HuffmanCodesTable.
+        meta.create_gate("HuffmanCodesTable: first (fixed) row", |meta| {
             let mut cb = BaseConstraintBuilder::default();
-            cb.gate(meta.query_fixed(q_enabled, Rotation::cur()))
+
+            // Canonical Huffman code starts with the weight of the first symbol, i.e. 0x00.
+            cb.require_equal(
+                "symbol == 0x00",
+                meta.query_advice(table.symbol, Rotation::cur()),
+                0x00.expr(),
+            );
+
+            // Weight accumulation starts with the first weight.
+            cb.require_equal(
+                "weight_acc == 2^(weight - 1)",
+                meta.query_advice(table.weight_acc, Rotation::cur()),
+                meta.query_advice(table.pow2_weight, Rotation::cur()),
+            );
+
+            // TODO: constrain the last bit_value of the maximum bitstring length.
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                meta.query_fixed(table.q_first, Rotation::cur()),
+            ]))
         });
 
-        huffman_table
+        // While we are processing the weights of a particular canonical Huffman code
+        // representation, i.e. byte_offset == byte_offset'.
+        meta.create_gate("HuffmanCodesTable: process canonical weights", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Sum of weights remains the same across all rows.
+            cb.require_equal(
+                "sum_weights' == sum_weights",
+                meta.query_advice(table.sum_weights, Rotation::next()),
+                meta.query_advice(table.sum_weights, Rotation::cur()),
+            );
+
+            // Maximum bitstring length remains the same across all rows.
+            cb.require_equal(
+                "sum_weights' == sum_weights",
+                meta.query_advice(table.max_bitstring_len, Rotation::next()),
+                meta.query_advice(table.max_bitstring_len, Rotation::cur()),
+            );
+
+            // Weight accumulation is assigned correctly.
+            cb.require_equal(
+                "weight_acc' == weight_acc + 2^(weight - 1)",
+                meta.query_advice(table.weight_acc, Rotation::next()),
+                meta.query_advice(table.weight_acc, Rotation::cur())
+                    + meta.query_advice(table.pow2_weight, Rotation::next()),
+            );
+
+            // pow2_weight is assigned correctly for weight == 0.
+            cb.condition(
+                table
+                    .weight_bits
+                    .value_equals(FseSymbol::S0, Rotation::cur())(meta),
+                |cb| {
+                    cb.require_zero(
+                        "pow2_weight == 0 if weight == 0",
+                        meta.query_advice(table.pow2_weight, Rotation::cur()),
+                    );
+                },
+            );
+
+            // For all rows (except the first row of a canonical Huffman code representation, we
+            // want to ensure the last_bit_values was assigned correctly.
+            let byte_offset_prev = meta.query_advice(table.byte_offset, Rotation::prev());
+            let byte_offset_cur = meta.query_advice(table.byte_offset, Rotation::cur());
+            let is_not_first = table.byte_offset_eq.expr_at(
+                meta,
+                Rotation::prev(),
+                byte_offset_prev,
+                byte_offset_cur,
+            );
+            cb.condition(is_not_first, |cb| {
+                for (symbol, &last_bit_value) in FseSymbol::iter().zip(table.last_bit_values.iter())
+                {
+                    cb.require_equal(
+                        "last_bit_value_i::cur == last_bit_value::prev + (weight::cur == i)",
+                        meta.query_advice(last_bit_value, Rotation::cur()),
+                        meta.query_advice(last_bit_value, Rotation::prev())
+                            + table.weight_bits.value_equals(symbol, Rotation::cur())(meta),
+                    );
+                }
+            });
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                table.byte_offset_eq.expr(),
+            ]))
+        });
+
+        // For every row, we want the pow2_weight column to be assigned correctly. We want:
+        //
+        // pow2_weight == 2^(weight - 1).
+        //
+        // Note that this is valid only if weight > 0. For weight == 0, we want pow2_weight == 0.
+        meta.lookup_any("HuffmanCodesTable: pow2_weight assignment", |meta| {
+            let condition = and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                not::expr(table
+                    .weight_bits
+                    .value_equals(FseSymbol::S0, Rotation::cur())(
+                    meta
+                )),
+                // TODO: add padding column.
+            ]);
+
+            let exponent = meta.query_advice(table.weight, Rotation::cur()) - 1.expr();
+            let exponentiation = meta.query_advice(table.pow2_weight, Rotation::cur());
+
+            [exponent, exponentiation]
+                .into_iter()
+                .zip(pow2_table.table_exprs(meta))
+                .map(|(input, table)| (input * condition.clone(), table))
+                .collect::<Vec<_>>()
+        });
+
+        // When we end processing a huffman code, i.e. the byte_offset changes. No need to check if
+        // the next row is padding or not.
+        meta.create_gate("HuffmanCodesTable: end of huffman code", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // The total sum of weights is in fact the accumulated weight. Note that we only
+            // accumulate weights until but excluding the last symbol. This is because, as per
+            // canonical Huffman code, the weight of the last symbol is deterministic (can be
+            // determined using the weights of all other occuring symbols).
+            //
+            // Hence the equality check is done on the "previous" row.
+            cb.require_equal(
+                "sum_weights == weight_acc",
+                meta.query_advice(table.sum_weights, Rotation::prev()),
+                meta.query_advice(table.weight_acc, Rotation::prev()),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                not::expr(table.byte_offset_eq.expr()),
+            ]))
+        });
+
+        // The weight for the last symbol is assigned appropriately. The weight for the last
+        // symbol should satisfy:
+        //
+        // last_weight == log2(nearest_pow2 - sum_weights) + 1
+        // where nearest_pow2 is the nearest power of 2 greater than the sum of weights so far.
+        //
+        // i.e. 2^(last_weight - 1) + sum_weights == 2^(max_bitstring_len)
+        meta.lookup_any("HuffmanCodesTable: weight of the last symbol", |meta| {
+            let condition = and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                not::expr(table.byte_offset_eq.expr()),
+            ]);
+
+            let exponent = meta.query_advice(table.max_bitstring_len, Rotation::cur());
+            let exponentiation = meta.query_advice(table.pow2_weight, Rotation::cur())
+                + meta.query_advice(table.sum_weights, Rotation::prev());
+
+            [exponent, exponentiation]
+                .into_iter()
+                .zip(pow2_table.table_exprs(meta))
+                .map(|(input, table)| (input * condition.clone(), table))
+                .collect::<Vec<_>>()
+        });
+
+        // When we transition from one Huffman code to another, i.e. the byte_offset changes. We
+        // also check that the next row is not a padding row.
+        //
+        // TODO: add the padding column.
+        meta.create_gate("HuffmanCodesTable: new huffman code", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Canonical Huffman code starts with the weight of the first symbol, i.e. 0x00.
+            cb.require_equal(
+                "symbol == 0x00",
+                meta.query_advice(table.symbol, Rotation::next()),
+                0x00.expr(),
+            );
+
+            // Weight accumulation starts with the first weight.
+            cb.require_equal(
+                "weight_acc == 2^(weight - 1)",
+                meta.query_advice(table.weight_acc, Rotation::next()),
+                meta.query_advice(table.pow2_weight, Rotation::next()),
+            );
+
+            // TODO: constrain the last bit_value of the maximum bitstring length.
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                meta.query_fixed(table.q_enabled, Rotation::next()),
+                not::expr(table.byte_offset_eq.expr()),
+            ]))
+        });
+
+        table
     }
 }
 
-impl<F: Field> LookupTable<F> for HuffmanCodesTable {
+impl<F: Field> LookupTable<F> for HuffmanCodesTable<F> {
     fn columns(&self) -> Vec<halo2_proofs::plonk::Column<halo2_proofs::plonk::Any>> {
         unimplemented!()
     }

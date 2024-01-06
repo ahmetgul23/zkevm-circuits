@@ -4,15 +4,24 @@ use strum_macros::EnumIter;
 
 use super::{params::N_BITS_PER_BYTE, util::value_bits_le};
 
+/// The symbol emitted by FSE table. This is also the weight in the canonical Huffman code.
 #[derive(Clone, Copy, Debug, EnumIter)]
 pub enum FseSymbol {
+    /// Weight == 0.
     S0 = 0,
+    /// Weight == 1.
     S1,
+    /// Weight == 2.
     S2,
+    /// Weight == 3.
     S3,
+    /// Weight == 4.
     S4,
+    /// Weight == 5.
     S5,
+    /// Weight == 6.
     S6,
+    /// Weight == 7.
     S7,
 }
 

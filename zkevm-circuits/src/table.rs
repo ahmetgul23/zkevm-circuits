@@ -26,7 +26,7 @@ use eth_types::{sign_types::SignData, Field, ToLittleEndian, ToScalar, ToWord, W
 use ethers_core::utils::keccak256;
 use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
-    util::{and, not, split_u256, split_u256_limb64, Expr},
+    util::{and, not, pow_of_two, split_u256, split_u256_limb64, Expr},
 };
 use halo2_proofs::{
     circuit::{AssignedCell, Layouter, Region, Value},
@@ -3186,5 +3186,61 @@ impl<const MAX: usize> RangeTable<MAX> {
 impl<const MAX: usize> From<RangeTable<MAX>> for TableColumn {
     fn from(table: RangeTable<MAX>) -> TableColumn {
         table.0
+    }
+}
+
+/// Lookup table for powers of 2.
+#[derive(Clone, Copy, Debug)]
+pub struct Pow2Table {
+    exponent: Column<Fixed>,
+    exponentiation: Column<Fixed>,
+}
+
+impl Pow2Table {
+    /// Construct the Pow2 table.
+    pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
+        Self {
+            exponent: meta.fixed_column(),
+            exponentiation: meta.fixed_column(),
+        }
+    }
+
+    /// Assign values to the Pow2 table.
+    pub fn load<F: Field>(&self, layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+        layouter.assign_region(
+            || "Pow2 table",
+            |mut region| {
+                for i in 0..8 {
+                    let exponentiation: F = pow_of_two(i);
+                    region.assign_fixed(
+                        || format!("Pow2: exponent at offset = {i}"),
+                        self.exponent,
+                        i,
+                        || Value::known(F::from(i as u64)),
+                    )?;
+                    region.assign_fixed(
+                        || format!("Pow2: exponentiation at offset = {i}"),
+                        self.exponentiation,
+                        i,
+                        || Value::known(exponentiation),
+                    )?;
+                }
+
+                Ok(())
+            },
+        )
+    }
+}
+
+impl<F: Field> LookupTable<F> for Pow2Table {
+    fn columns(&self) -> Vec<Column<Any>> {
+        vec![self.exponent.into(), self.exponentiation.into()]
+    }
+
+    fn annotations(&self) -> Vec<String> {
+        vec![
+            String::from("pow2table: exponent"),
+            String::from("pow2table: exponentiation"),
+        ]
     }
 }
