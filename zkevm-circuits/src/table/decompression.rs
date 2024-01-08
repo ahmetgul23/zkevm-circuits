@@ -814,12 +814,43 @@ impl HuffmanCodesBitstringAccumulationTable {
     }
 }
 
-impl<F: Field> LookupTable<F> for HuffmanCodesBitstringAccumulationTable {
-    fn columns(&self) -> Vec<halo2_proofs::plonk::Column<halo2_proofs::plonk::Any>> {
-        unimplemented!()
+impl HuffmanCodesBitstringAccumulationTable {
+    /// Lookup table expressions for a bitsteam completely contained within the bits of a single
+    /// byte in the encoded data.
+    pub fn table_exprs_contained<F: Field>(
+        &self,
+        meta: &mut VirtualCells<F>,
+    ) -> Vec<Expression<F>> {
+        vec![
+            meta.query_advice(self.instance_idx, Rotation::cur()),
+            meta.query_advice(self.frame_idx, Rotation::cur()),
+            meta.query_advice(self.byte_offset, Rotation::cur()),
+            meta.query_advice(self.byte_idx_1, Rotation::cur()),
+            meta.query_advice(self.byte_1, Rotation::cur()),
+            meta.query_advice(self.bit_value, Rotation::cur()),
+            meta.query_advice(self.bitstring_len, Rotation::cur()),
+            meta.query_fixed(self.bit_index, Rotation::cur()),
+            meta.query_advice(self.from_start, Rotation::cur()),
+            meta.query_advice(self.until_end, Rotation::cur()),
+        ]
     }
 
-    fn annotations(&self) -> Vec<String> {
-        unimplemented!()
+    /// Lookup table expressions for a bitstream that spans over 2 consequtive bytes in the
+    /// encoded data.
+    pub fn table_exprs_spanned<F: Field>(&self, meta: &mut VirtualCells<F>) -> Vec<Expression<F>> {
+        vec![
+            meta.query_advice(self.instance_idx, Rotation::cur()),
+            meta.query_advice(self.frame_idx, Rotation::cur()),
+            meta.query_advice(self.byte_offset, Rotation::cur()),
+            meta.query_advice(self.byte_idx_1, Rotation::cur()),
+            meta.query_advice(self.byte_idx_2, Rotation::cur()),
+            meta.query_advice(self.byte_1, Rotation::cur()),
+            meta.query_advice(self.byte_2, Rotation::cur()),
+            meta.query_advice(self.bit_value, Rotation::cur()),
+            meta.query_advice(self.bitstring_len, Rotation::cur()),
+            meta.query_fixed(self.bit_index, Rotation::cur()),
+            meta.query_advice(self.from_start, Rotation::cur()),
+            meta.query_advice(self.until_end, Rotation::cur()),
+        ]
     }
 }
