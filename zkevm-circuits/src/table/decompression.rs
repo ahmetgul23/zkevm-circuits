@@ -6,17 +6,18 @@ use gadgets::{
     util::{and, not, Expr},
 };
 use halo2_proofs::{
-    plonk::{Advice, Column, ConstraintSystem, Expression, Fixed, VirtualCells},
+    plonk::{Advice, Any, Column, ConstraintSystem, Expression, Fixed, VirtualCells},
     poly::Rotation,
 };
 use strum::IntoEnumIterator;
 
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
+    table::BitwiseOp,
     witness::{FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS},
 };
 
-use super::{LookupTable, Pow2Table};
+use super::{BitwiseOpTable, LookupTable, Pow2Table, RangeTable};
 
 /// The finite state entropy table in its default view, i.e. when the ``state`` increments.
 ///
@@ -35,7 +36,7 @@ use super::{LookupTable, Pow2Table};
 ///
 /// [doclink]: https://nigeltao.github.io/blog/2022/zstandard-part-5-fse.html#state-machine
 #[derive(Clone, Debug)]
-pub struct FseTable {
+pub struct FseTable<F> {
     /// Fixed column to denote whether the constraints will be enabled or not.
     pub q_enabled: Column<Fixed>,
     /// The encoded/decoded data's instance ID where this FSE table belongs.
@@ -45,6 +46,8 @@ pub struct FseTable {
     /// The byte offset within the data instance where the encoded FSE table begins. This is
     /// 1-indexed, i.e. byte_offset == 1 at the first byte.
     pub byte_offset: Column<Advice>,
+    /// Helper gadget to know when we are done handling a single canonical Huffman code.
+    pub byte_offset_eq: IsEqualConfig<F>,
     /// The size of the FSE table that starts at byte_offset.
     pub table_size: Column<Advice>,
     /// Incremental index for this specific FSE table.
@@ -55,61 +58,138 @@ pub struct FseTable {
     /// Denotes the weight from the canonical Huffman code representation of the Huffman code. This
     /// is also the symbol emitted from the FSE table at this row's state.
     pub symbol: Column<Advice>,
-    /// The binary representation of the symbol value.
-    pub symbol_bits: BinaryNumberConfig<FseSymbol, N_BITS_SYMBOL>,
     /// Denotes the baseline field.
     pub baseline: Column<Advice>,
-    /// The last seen baseline fields by symbol.
-    pub last_baselines: [Column<Advice>; N_MAX_SYMBOLS],
     /// The number of bits to be read from bitstream at this state.
     pub nb: Column<Advice>,
-    /// The smaller power of two assigned to this state. The following must hold:
-    /// - 2 ^ nb == SPoT.
-    pub spot: Column<Advice>,
-    /// The last seen SPoT at a state.
-    pub last_spots: [Column<Advice>; N_MAX_SYMBOLS],
-    /// An accumulator over SPoTs values.
-    pub spot_accs: [Column<Advice>; N_MAX_SYMBOLS],
 }
 
-impl FseTable {
-    pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
+impl<F: Field> FseTable<F> {
+    pub fn construct(meta: &mut ConstraintSystem<F>, aux_table: FseAuxiliaryTable<F>) -> Self {
         let q_enabled = meta.fixed_column();
-        let symbol = meta.advice_column();
-        let fse_table = Self {
+        let byte_offset = meta.advice_column();
+        let table = Self {
             q_enabled,
             instance_idx: meta.advice_column(),
             frame_idx: meta.advice_column(),
-            byte_offset: meta.advice_column(),
+            byte_offset,
+            byte_offset_eq: IsEqualChip::configure(
+                meta,
+                |meta| meta.query_fixed(q_enabled, Rotation::cur()),
+                |meta| meta.query_advice(byte_offset, Rotation::cur()),
+                |meta| meta.query_advice(byte_offset, Rotation::next()),
+            ),
             table_size: meta.advice_column(),
             idx: meta.advice_column(),
             state: meta.advice_column(),
-            symbol,
-            symbol_bits: BinaryNumberChip::configure(meta, q_enabled, Some(symbol.into())),
+            symbol: meta.advice_column(),
             baseline: meta.advice_column(),
-            last_baselines: array_init(|_| meta.advice_column()),
             nb: meta.advice_column(),
-            spot: meta.advice_column(),
-            last_spots: array_init(|_| meta.advice_column()),
-            spot_accs: array_init(|_| meta.advice_column()),
         };
 
-        meta.create_gate("TODO", |meta| {
+        // TODO: byte_offset' >= byte_offset.
+
+        // Constraints while we are in the same instance of FseTable.
+        meta.create_gate("FseTable: while traversing the same table", |meta| {
             let mut cb = BaseConstraintBuilder::default();
-            cb.gate(meta.query_fixed(q_enabled, Rotation::cur()))
+
+            // Table size remains unchanged.
+            cb.require_equal(
+                "while byte_offset' == byte_offset: table_size remain unchanged",
+                meta.query_advice(table.table_size, Rotation::next()),
+                meta.query_advice(table.table_size, Rotation::cur()),
+            );
+
+            // Index is incremental.
+            cb.require_equal(
+                "idx' == idx + 1",
+                meta.query_advice(table.idx, Rotation::next()),
+                meta.query_advice(table.idx, Rotation::cur()) + 1.expr(),
+            );
+
+            // State is incremental.
+            cb.require_equal(
+                "state' == state + 1",
+                meta.query_advice(table.state, Rotation::next()),
+                meta.query_advice(table.state, Rotation::cur()) + 1.expr(),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                table.byte_offset_eq.expr(),
+            ]))
         });
 
-        fse_table
+        // Constraints for last row of an FSE table.
+        meta.create_gate("FseTable: last row of the table", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Constraint for idx == table_size.
+            cb.require_equal(
+                "idx == table_size",
+                meta.query_advice(table.idx, Rotation::cur()),
+                meta.query_advice(table.table_size, Rotation::cur()),
+            );
+
+            // Constraint for state == table_size - 1.
+            cb.require_equal(
+                "state == table_size - 1",
+                meta.query_advice(table.state, Rotation::cur()) + 1.expr(),
+                meta.query_advice(table.table_size, Rotation::cur()),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enabled, Rotation::cur()),
+                not::expr(table.byte_offset_eq.expr()),
+            ]))
+        });
+
+        // Validate the (state, symbol) tuple against auxiliary table.
+        meta.lookup_any(
+            "FseTable: validate (state, symbol) against auxiliary table",
+            |meta| {
+                let condition = meta.query_fixed(table.q_enabled, Rotation::cur());
+
+                [
+                    meta.query_advice(table.instance_idx, Rotation::cur()),
+                    meta.query_advice(table.frame_idx, Rotation::cur()),
+                    meta.query_advice(table.byte_offset, Rotation::cur()),
+                    meta.query_advice(table.table_size, Rotation::cur()),
+                    meta.query_advice(table.state, Rotation::cur()),
+                    meta.query_advice(table.symbol, Rotation::cur()),
+                    meta.query_advice(table.baseline, Rotation::cur()),
+                    meta.query_advice(table.nb, Rotation::cur()),
+                ]
+                .into_iter()
+                .zip(aux_table.table_exprs_state_check(meta))
+                .map(|(input, table)| (input * condition.expr(), table))
+                .collect::<Vec<_>>()
+            },
+        );
+
+        debug_assert!(meta.degree() <= 9);
+
+        table
     }
 }
 
-impl<F: Field> LookupTable<F> for FseTable {
-    fn columns(&self) -> Vec<halo2_proofs::plonk::Column<halo2_proofs::plonk::Any>> {
-        unimplemented!()
+impl<F: Field> LookupTable<F> for FseTable<F> {
+    fn columns(&self) -> Vec<Column<Any>> {
+        vec![
+            self.instance_idx.into(),
+            self.frame_idx.into(),
+            self.byte_offset.into(),
+            self.table_size.into(),
+        ]
     }
 
     fn annotations(&self) -> Vec<String> {
-        unimplemented!()
+        vec![
+            String::from("instance_idx"),
+            String::from("frame_idx"),
+            String::from("byte_offset"),
+            String::from("table_size"),
+        ]
     }
 }
 
@@ -118,19 +198,22 @@ impl<F: Field> LookupTable<F> for FseTable {
 /// symbol. Which means, we will have rows with symbol s0 (and varying, but not necessarily
 /// incremental states) clubbed together, followed by symbol s1 and so on.
 ///
-/// | State | Symbol | Baseline | Nb  |
-/// |-------|--------|----------|-----|
-/// | 0x00  | s0     | ...      | ... |
-/// | 0x01  | s0     | ...      | ... |
-/// | 0x02  | s0     | ...      | ... |
-/// | 0x03  | s1     | ...      | ... |
-/// | 0x0c  | s1     | ...      | ... |
-/// | 0x11  | s1     | ...      | ... |
-/// | 0x15  | s1     | ...      | ... |
-/// | 0x1a  | s1     | ...      | ... |
-/// | 0x1e  | s1     | ...      | ... |
-/// | ...   | ...    | ...      | ... |
-/// | 0x09  | s6     | ...      | ... |
+/// | State | Symbol | Baseline | Nb  | Baseline Mark |
+/// |-------|--------|----------|-----|---------------|
+/// | 0x00  | s0     | ...      | ... | 0             |
+/// | 0x01  | s0     | ...      | ... | 0             |
+/// | 0x02  | s0     | ...      | ... | 0             |
+/// | ...   | s0     | ...      | ... | ...           |
+/// | 0x1d  | s0     | ...      | ... | 0             |
+/// | 0x03  | s1  -> | 0x10     | ... | 0             |
+/// | 0x0c  | s1  -> | 0x18     | ... | 0             |
+/// | 0x11  | s1  -> | 0x00     | ... | 1             |
+/// | 0x15  | s1  -> | 0x04     | ... | 1             |
+/// | 0x1a  | s1  -> | 0x08     | ... | 1             |
+/// | 0x1e  | s1  -> | 0x0c     | ... | 1             |
+/// | 0x08  | s2     | ...      | ... | 0             |
+/// | ...   | ...    | ...      | ... | 0             |
+/// | 0x09  | s6     | ...      | ... | 0             |
 ///
 /// Above is a representation of this table. Primarily we are interested in verifying that:
 /// - next state (for the same symbol) was assigned correctly
@@ -140,7 +223,7 @@ impl<F: Field> LookupTable<F> for FseTable {
 ///
 /// [doclink]: https://nigeltao.github.io/blog/2022/zstandard-part-5-fse.html#fse-reconstruction
 #[derive(Clone, Debug)]
-pub struct FseAuxiliaryTable {
+pub struct FseAuxiliaryTable<F> {
     /// Fixed column to denote whether the constraints will be enabled or not.
     pub q_enabled: Column<Fixed>,
     /// The encoded/decoded data's instance ID where this FSE table belongs.
@@ -150,6 +233,8 @@ pub struct FseAuxiliaryTable {
     /// The byte offset within the data instance where the encoded FSE table begins. This is
     /// 1-indexed, i.e. byte_offset == 1 at the first byte.
     pub byte_offset: Column<Advice>,
+    /// Helper gadget to know when we are done handling a single canonical Huffman code.
+    pub byte_offset_eq: IsEqualConfig<F>,
     /// The size of the FSE table that starts at byte_offset.
     pub table_size: Column<Advice>,
     /// Helper column for (table_size >> 1).
@@ -160,6 +245,8 @@ pub struct FseAuxiliaryTable {
     pub idx: Column<Advice>,
     /// The symbol (weight) assigned to this state.
     pub symbol: Column<Advice>,
+    /// Helper gadget to know whether the symbol is the same or not.
+    pub symbol_eq: IsEqualConfig<F>,
     /// Represents the number of times this symbol appears in the FSE table. This value does not
     /// change while the symbol in the table remains the same.
     pub symbol_count: Column<Advice>,
@@ -173,42 +260,370 @@ pub struct FseAuxiliaryTable {
     ///
     /// where state' is the next row's state.
     pub state: Column<Advice>,
+    /// Denotes the baseline field.
+    pub baseline: Column<Advice>,
+    /// Helper column to mark the baseline observed at the last occurence of a symbol.
+    pub last_baseline: Column<Advice>,
+    /// The number of bits to be read from bitstream at this state.
+    pub nb: Column<Advice>,
+    /// The smaller power of two assigned to this state. The following must hold:
+    /// - 2 ^ nb == SPoT.
+    pub spot: Column<Advice>,
+    /// An accumulator over SPoT value.
+    pub spot_acc: Column<Advice>,
+    /// Helper column to remember the smallest spot for that symbol.
+    pub smallest_spot: Column<Advice>,
+    /// Helper boolean column which is set only from baseline == 0x00.
+    pub baseline_mark: Column<Advice>,
 }
 
-impl FseAuxiliaryTable {
-    pub fn construct<F: Field>(meta: &mut ConstraintSystem<F>) -> Self {
+impl<F: Field> FseAuxiliaryTable<F> {
+    pub fn construct(
+        meta: &mut ConstraintSystem<F>,
+        bitwise_op_table: BitwiseOpTable,
+        pow2_table: Pow2Table,
+        range_table: RangeTable<8>,
+    ) -> Self {
         let q_enabled = meta.fixed_column();
-        let aux_table = Self {
+        let byte_offset = meta.advice_column();
+        let symbol = meta.advice_column();
+        let spot = meta.advice_column();
+        let smallest_spot = meta.advice_column();
+        let table = Self {
             q_enabled,
             instance_idx: meta.advice_column(),
             frame_idx: meta.advice_column(),
-            byte_offset: meta.advice_column(),
+            byte_offset,
+            byte_offset_eq: IsEqualChip::configure(
+                meta,
+                |meta| meta.query_fixed(q_enabled, Rotation::cur()),
+                |meta| meta.query_advice(byte_offset, Rotation::cur()),
+                |meta| meta.query_advice(byte_offset, Rotation::next()),
+            ),
             table_size: meta.advice_column(),
             table_size_rs_1: meta.advice_column(),
             table_size_rs_3: meta.advice_column(),
             idx: meta.advice_column(),
-            symbol: meta.advice_column(),
+            symbol,
+            symbol_eq: IsEqualChip::configure(
+                meta,
+                |meta| meta.query_fixed(q_enabled, Rotation::cur()),
+                |meta| meta.query_advice(symbol, Rotation::cur()),
+                |meta| meta.query_advice(symbol, Rotation::next()),
+            ),
             symbol_count: meta.advice_column(),
             symbol_count_acc: meta.advice_column(),
             state: meta.advice_column(),
+            baseline: meta.advice_column(),
+            last_baseline: meta.advice_column(),
+            nb: meta.advice_column(),
+            spot,
+            spot_acc: meta.advice_column(),
+            smallest_spot,
+            baseline_mark: meta.advice_column(),
         };
 
-        meta.create_gate("TODO", |meta| {
+        // TODO: byte_offset' >= byte_offset.
+
+        // All rows.
+        meta.create_gate("FseAuxiliaryTable: all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
-            cb.gate(meta.query_fixed(q_enabled, Rotation::cur()))
+
+            cb.require_boolean(
+                "baseline_mark == [0, 1]",
+                meta.query_advice(table.baseline_mark, Rotation::cur()),
+            );
+
+            cb.gate(meta.query_fixed(table.q_enabled, Rotation::cur()))
         });
 
-        aux_table
+        // Constraints while traversing an FSE table.
+        meta.create_gate("FseAuxiliaryTable: table size and helper columns", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Table size, and the right-shifted helper values remain unchanged.
+            for col in [
+                table.table_size,
+                table.table_size_rs_1,
+                table.table_size_rs_3,
+            ] {
+                cb.require_equal(
+                    "while byte_offset' == byte_offset: table_size and helpers remain unchanged",
+                    meta.query_advice(col, Rotation::next()),
+                    meta.query_advice(col, Rotation::cur()),
+                );
+            }
+
+            // Index is incremental.
+            cb.require_equal(
+                "idx' == idx + 1",
+                meta.query_advice(table.idx, Rotation::next()),
+                meta.query_advice(table.idx, Rotation::cur()) + 1.expr(),
+            );
+
+            cb.require_boolean(
+                "symbol' == symbol or symbol' == symbol + 1",
+                meta.query_advice(table.symbol, Rotation::next())
+                    - meta.query_advice(table.symbol, Rotation::cur()),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                table.byte_offset_eq.expr(),
+            ]))
+        });
+
+        // Validate SPoT assignment.
+        meta.lookup_any("FseAuxiliaryTable: SPoT == 2 ^ Nb", |meta| {
+            let condition = meta.query_fixed(table.q_enabled, Rotation::cur());
+
+            [
+                meta.query_advice(table.nb, Rotation::cur()),
+                meta.query_advice(table.spot, Rotation::cur()),
+            ]
+            .into_iter()
+            .zip(pow2_table.table_exprs(meta))
+            .map(|(input, table)| (input * condition.clone(), table))
+            .collect::<Vec<_>>()
+        });
+
+        // Constraints for last row of an FSE table.
+        meta.create_gate("FseAuxiliaryTable: table shift right ops", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Constraint for table_size >> 1.
+            cb.require_boolean(
+                "table_size >> 1",
+                meta.query_advice(table.table_size, Rotation::cur())
+                    - (meta.query_advice(table.table_size_rs_1, Rotation::cur()) * 2.expr()),
+            );
+
+            // Constraint for idx == table_size.
+            cb.require_equal(
+                "idx == table_size",
+                meta.query_advice(table.idx, Rotation::cur()),
+                meta.query_advice(table.table_size, Rotation::cur()),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enabled, Rotation::cur()),
+                not::expr(table.byte_offset_eq.expr()),
+            ]))
+        });
+
+        // Constraint for table_size >> 3. Only check on the last row.
+        meta.lookup("FseAuxiliaryTable: table shift right ops", |meta| {
+            let condition = and::expr([
+                meta.query_fixed(q_enabled, Rotation::cur()),
+                not::expr(table.byte_offset_eq.expr()),
+            ]);
+
+            let range_value = meta.query_advice(table.table_size, Rotation::cur())
+                - (meta.query_advice(table.table_size_rs_3, Rotation::cur()) * 8.expr());
+
+            vec![(condition * range_value, range_table.into())]
+        });
+
+        // Constraint for state' calculation. We wish to constrain:
+        //
+        // - state' == state'' & (table_size - 1)
+        // - state'' == state + (table_size >> 3) + (table_size >> 1) + 3
+        meta.lookup_any("FseAuxiliaryTable: next state computation", |meta| {
+            let condition = and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                table.byte_offset_eq.expr(),
+            ]);
+
+            let lhs = meta.query_advice(table.state, Rotation::cur())
+                + meta.query_advice(table.table_size_rs_3, Rotation::cur())
+                + meta.query_advice(table.table_size_rs_1, Rotation::cur())
+                + 3.expr();
+            let rhs = meta.query_advice(table.table_size, Rotation::cur()) - 1.expr();
+            let output = meta.query_advice(table.state, Rotation::next());
+
+            [BitwiseOp::AND.expr(), lhs, rhs, output]
+                .into_iter()
+                .zip(bitwise_op_table.table_exprs(meta))
+                .map(|(input, table)| (input * condition.clone(), table))
+                .collect::<Vec<_>>()
+        });
+
+        // Constraints for same FSE table and same symbol.
+        meta.create_gate("FseAuxiliaryTable: symbol' == symbol", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Symbol's count remains unchanged while symbol remained unchanged.
+            cb.require_equal(
+                "if symbol' == symbol: symbol_count' == symbol_count",
+                meta.query_advice(table.symbol_count, Rotation::next()),
+                meta.query_advice(table.symbol_count, Rotation::cur()),
+            );
+
+            // SPoT at baseline == 0x00 remains unchanged over these rows.
+            cb.require_equal(
+                "if symbol' == symbol: smallest SPoT is unchanged",
+                meta.query_advice(table.smallest_spot, Rotation::next()),
+                meta.query_advice(table.smallest_spot, Rotation::cur()),
+            );
+
+            // last baseline remains unchanged over these rows.
+            cb.require_equal(
+                "if symbol' == symbol: last baseline is unchanged",
+                meta.query_advice(table.last_baseline, Rotation::next()),
+                meta.query_advice(table.last_baseline, Rotation::cur()),
+            );
+
+            // Symbol count accumulator increments.
+            cb.require_equal(
+                "if symbol' == symbol: symbol count accumulator increments",
+                meta.query_advice(table.symbol_count_acc, Rotation::next()),
+                meta.query_advice(table.symbol_count_acc, Rotation::cur()) + 1.expr(),
+            );
+
+            // SPoT accumulation.
+            cb.require_equal(
+                "SPoT_acc::next == SPoT_acc::cur + SPoT::next",
+                meta.query_advice(table.spot_acc, Rotation::next()),
+                meta.query_advice(table.spot_acc, Rotation::cur())
+                    + meta.query_advice(table.spot, Rotation::next()),
+            );
+
+            // baseline_mark can only transition from 0 to 1 once.
+            cb.require_boolean(
+                "baseline_mark transition",
+                meta.query_advice(table.baseline_mark, Rotation::next())
+                    - meta.query_advice(table.baseline_mark, Rotation::cur()),
+            );
+
+            let is_next_baseline_0x00 = meta.query_advice(table.baseline_mark, Rotation::next())
+                - meta.query_advice(table.baseline_mark, Rotation::cur());
+            cb.condition(is_next_baseline_0x00.expr(), |cb| {
+                cb.require_equal(
+                    "baseline::next == 0x00",
+                    meta.query_advice(table.baseline, Rotation::next()),
+                    0x00.expr(),
+                );
+            });
+            cb.condition(not::expr(is_next_baseline_0x00.expr()), |cb| {
+                cb.require_equal(
+                    "baseline::next == baseline::cur + spot::cur",
+                    meta.query_advice(table.baseline, Rotation::next()),
+                    meta.query_advice(table.baseline, Rotation::cur())
+                        + meta.query_advice(table.spot, Rotation::cur()),
+                );
+            });
+
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                table.byte_offset_eq.expr(),
+                table.symbol_eq.expr(),
+            ]))
+        });
+
+        // Constraints when symbol changes in an FSE table, i.e. symbol' != symbol.
+        meta.create_gate("FseAuxiliaryTable: symbol' != symbol", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Constraint for idx == table_size.
+            cb.require_equal(
+                "symbol_count_acc == symbol_count",
+                meta.query_advice(table.symbol_count_acc, Rotation::cur()),
+                meta.query_advice(table.symbol_count, Rotation::cur()),
+            );
+
+            // SPoT accumulator == table_size at the end of processing the symbol.
+            cb.require_equal(
+                "SPoT_acc == table_size",
+                meta.query_advice(table.spot_acc, Rotation::cur()),
+                meta.query_advice(table.table_size, Rotation::cur()),
+            );
+
+            // The SPoT at baseline == 0x00 matches this SPoT.
+            cb.require_equal(
+                "last symbol occurrence => SPoT == SPoT at baseline 0x00",
+                meta.query_advice(table.smallest_spot, Rotation::cur()),
+                meta.query_advice(table.spot, Rotation::cur()),
+            );
+
+            // last baseline matches.
+            cb.require_equal(
+                "baseline == last_baseline",
+                meta.query_advice(table.baseline, Rotation::cur()),
+                meta.query_advice(table.last_baseline, Rotation::cur()),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enabled, Rotation::cur()),
+                not::expr(table.symbol_eq.expr()),
+            ]))
+        });
+
+        // Constraints for the first occurence of a particular symbol in the table.
+        meta.create_gate("FseAuxiliaryTable: new symbol", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            let is_baseline_marked = meta.query_advice(table.baseline_mark, Rotation::cur());
+            cb.condition(is_baseline_marked.expr(), |cb| {
+                cb.require_equal(
+                    "baseline == 0x00",
+                    meta.query_advice(table.baseline, Rotation::cur()),
+                    0x00.expr(),
+                );
+            });
+
+            cb.condition(not::expr(is_baseline_marked.expr()), |cb| {
+                cb.require_equal(
+                    "baseline == last_baseline + smallest_spot",
+                    meta.query_advice(table.baseline, Rotation::cur()),
+                    meta.query_advice(table.last_baseline, Rotation::cur())
+                        + meta.query_advice(table.smallest_spot, Rotation::cur()),
+                );
+            });
+
+            let symbol_prev = meta.query_advice(table.symbol, Rotation::prev());
+            let symbol_cur = meta.query_advice(table.symbol, Rotation::cur());
+            cb.gate(and::expr([
+                meta.query_fixed(table.q_enabled, Rotation::cur()),
+                not::expr(
+                    table
+                        .symbol_eq
+                        .expr_at(meta, Rotation::prev(), symbol_prev, symbol_cur),
+                ),
+            ]))
+        });
+
+        debug_assert!(meta.degree() <= 9);
+
+        table
     }
 }
 
-impl<F: Field> LookupTable<F> for FseAuxiliaryTable {
-    fn columns(&self) -> Vec<halo2_proofs::plonk::Column<halo2_proofs::plonk::Any>> {
-        unimplemented!()
+impl<F: Field> FseAuxiliaryTable<F> {
+    /// Lookup table expressions for (state, symbol) tuple check.
+    pub fn table_exprs_state_check(&self, meta: &mut VirtualCells<F>) -> Vec<Expression<F>> {
+        vec![
+            meta.query_advice(self.instance_idx, Rotation::cur()),
+            meta.query_advice(self.frame_idx, Rotation::cur()),
+            meta.query_advice(self.byte_offset, Rotation::cur()),
+            meta.query_advice(self.table_size, Rotation::cur()),
+            meta.query_advice(self.state, Rotation::cur()),
+            meta.query_advice(self.symbol, Rotation::cur()),
+            meta.query_advice(self.baseline, Rotation::cur()),
+            meta.query_advice(self.nb, Rotation::cur()),
+        ]
     }
 
-    fn annotations(&self) -> Vec<String> {
-        unimplemented!()
+    /// Lookup table expressions for (symbol, symbol_count) tuple check.
+    pub fn table_exprs_symbol_count_check(&self, meta: &mut VirtualCells<F>) -> Vec<Expression<F>> {
+        vec![
+            meta.query_advice(self.instance_idx, Rotation::cur()),
+            meta.query_advice(self.frame_idx, Rotation::cur()),
+            meta.query_advice(self.byte_offset, Rotation::cur()),
+            meta.query_advice(self.table_size, Rotation::cur()),
+            meta.query_advice(self.symbol, Rotation::cur()),
+            meta.query_advice(self.symbol_count, Rotation::cur()),
+            meta.query_advice(self.symbol_count_acc, Rotation::cur()),
+        ]
     }
 }
 
@@ -484,12 +899,14 @@ impl<F: Field> HuffmanCodesTable<F> {
             ]))
         });
 
+        debug_assert!(meta.degree() <= 9);
+
         table
     }
 }
 
 impl<F: Field> LookupTable<F> for HuffmanCodesTable<F> {
-    fn columns(&self) -> Vec<halo2_proofs::plonk::Column<halo2_proofs::plonk::Any>> {
+    fn columns(&self) -> Vec<Column<Any>> {
         unimplemented!()
     }
 
@@ -809,6 +1226,8 @@ impl HuffmanCodesBitstringAccumulationTable {
                 cb.gate(meta.query_fixed(table.q_enabled, Rotation::cur()))
             },
         );
+
+        debug_assert!(meta.degree() <= 9);
 
         table
     }

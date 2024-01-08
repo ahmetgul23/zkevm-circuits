@@ -1,5 +1,6 @@
 use eth_types::Field;
-use halo2_proofs::circuit::Value;
+use gadgets::impl_expr;
+use halo2_proofs::{circuit::Value, plonk::Expression};
 use strum_macros::EnumIter;
 
 use super::{params::N_BITS_PER_BYTE, util::value_bits_le};
@@ -24,6 +25,8 @@ pub enum FseSymbol {
     /// Weight == 7.
     S7,
 }
+
+impl_expr!(FseSymbol);
 
 impl From<FseSymbol> for usize {
     fn from(value: FseSymbol) -> Self {
