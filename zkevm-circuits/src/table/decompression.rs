@@ -3,10 +3,10 @@ use eth_types::Field;
 use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
     is_equal::{IsEqualChip, IsEqualConfig},
-    util::{and, not, sum, Expr},
+    util::{and, not, Expr},
 };
 use halo2_proofs::{
-    plonk::{Advice, Column, ConstraintSystem, Fixed},
+    plonk::{Advice, Column, ConstraintSystem, Expression, Fixed, VirtualCells},
     poly::Rotation,
 };
 use strum::IntoEnumIterator;
@@ -534,6 +534,11 @@ pub struct HuffmanCodesBitstringAccumulationTable {
     /// 15 and then is reset to 0. Repeats while we finish bitstring accumulation of all bitstrings
     /// used in the Huffman codes.
     pub bit_index: Column<Fixed>,
+    /// Helper column to know the start of a new chunk of 2 bytes, this is a fixed column as well
+    /// as it is set only on bit_index == 0.
+    pub q_first: Column<Fixed>,
+    /// Helper column that is set if bit_index < 8.
+    pub q_bit_index_lo: Column<Fixed>,
     /// The bit at bit_index. Accumulation of bits from 0 <= bit_index <= 7 denotes byte_1.
     /// Accumulation of 8 <= bit_index <= 15 denotes byte_2.
     pub bit: Column<Advice>,
@@ -541,14 +546,16 @@ pub struct HuffmanCodesBitstringAccumulationTable {
     pub bit_value_acc_1: Column<Advice>,
     /// The accumulator over 8 <= bit_index <= 15.
     pub bit_value_acc_2: Column<Advice>,
+    /// The final value of the bit accumulation for the set bits.
+    pub bit_value: Column<Advice>,
+    /// The length of the bitstring, i.e. the number of bits that were set.
+    pub bitstring_len: Column<Advice>,
     /// The accumulator over bits from is_start to is_end, i.e. while is_set == 1.
     pub bit_value_acc: Column<Advice>,
-    /// To mark the bit_index at which the bitstring starts.
-    pub is_start: Column<Advice>,
-    /// To mark the bit_index at which the bitstring ends.
-    pub is_end: Column<Advice>,
-    /// Boolean that is set from is_start to is_end.
-    pub is_set: Column<Advice>,
+    /// Boolean that is set from start of bit chunk to bit_index == 15.
+    pub from_start: Column<Advice>,
+    /// Boolean that is set from bit_index == 0 to end of bit chunk.
+    pub until_end: Column<Advice>,
 }
 
 impl HuffmanCodesBitstringAccumulationTable {
@@ -564,19 +571,244 @@ impl HuffmanCodesBitstringAccumulationTable {
             byte_1: meta.advice_column(),
             byte_2: meta.advice_column(),
             bit_index: meta.fixed_column(),
+            q_first: meta.fixed_column(),
+            q_bit_index_lo: meta.fixed_column(),
             bit: meta.advice_column(),
             bit_value_acc_1: meta.advice_column(),
             bit_value_acc_2: meta.advice_column(),
+            bit_value: meta.advice_column(),
+            bitstring_len: meta.advice_column(),
             bit_value_acc: meta.advice_column(),
-            is_start: meta.advice_column(),
-            is_end: meta.advice_column(),
-            is_set: meta.advice_column(),
+            from_start: meta.advice_column(),
+            until_end: meta.advice_column(),
         };
 
-        meta.create_gate("TODO", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-            cb.gate(meta.query_fixed(q_enabled, Rotation::cur()))
-        });
+        meta.create_gate(
+            "HuffmanCodesBitstringAccumulationTable: bit accumulation",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
+
+                let q_bit_idx_lo = meta.query_fixed(table.q_bit_index_lo, Rotation::cur());
+
+                let is_first = meta.query_fixed(table.q_first, Rotation::cur());
+                let is_lo_bit_idx = and::expr([not::expr(is_first.expr()), q_bit_idx_lo.expr()]);
+                let is_hi_bit_idx = not::expr(q_bit_idx_lo);
+                let is_bit_idx_eq_8 = and::expr([
+                    meta.query_fixed(table.q_bit_index_lo, Rotation::prev()),
+                    is_hi_bit_idx.expr(),
+                ]);
+                let is_last = meta.query_fixed(table.q_first, Rotation::next());
+
+                // Constrain bit_value_acc's for bit_index == 0.
+                cb.condition(is_first.expr(), |cb| {
+                    cb.require_equal(
+                        "if q_first == True: bit_value_acc_1 == bit",
+                        meta.query_advice(table.bit_value_acc_1, Rotation::cur()),
+                        meta.query_advice(table.bit, Rotation::cur()),
+                    );
+                    cb.require_equal(
+                        "if q_first == True: bit_value_acc_2 == 0",
+                        meta.query_advice(table.bit_value_acc_2, Rotation::cur()),
+                        0.expr(),
+                    );
+                });
+
+                // Constrain bit_value_acc's for 1 <= bit_index < 8.
+                cb.condition(is_lo_bit_idx, |cb| {
+                    cb.require_equal(
+                        "if bit_index < 8: bit_value_acc_1 check",
+                        meta.query_advice(table.bit_value_acc_1, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc_1, Rotation::prev()) * 2.expr()
+                            + meta.query_advice(table.bit, Rotation::cur()),
+                    );
+                    cb.require_equal(
+                        "if bit_index < 8: bit_value_acc_2 check",
+                        meta.query_advice(table.bit_value_acc_2, Rotation::cur()),
+                        0.expr(),
+                    );
+                });
+
+                // Constrain bit_value_acc's for bit_index >= 8.
+                cb.condition(is_hi_bit_idx, |cb| {
+                    cb.require_equal(
+                        "if bit_index >= 8: bit_value_acc_1 eq",
+                        meta.query_advice(table.bit_value_acc_1, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc_1, Rotation::prev()),
+                    );
+                    cb.require_equal(
+                        "if bit_index >= 8: bit_value_acc_2 check",
+                        meta.query_advice(table.bit_value_acc_2, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc_2, Rotation::prev()) * 2.expr()
+                            + meta.query_advice(table.bit, Rotation::cur()),
+                    );
+                });
+
+                // Constrain columns that are unchanged from 0 <= bit_idx <= 15.
+                cb.condition(not::expr(is_first), |cb| {
+                    for col in [table.byte_1, table.byte_2, table.bit_value] {
+                        cb.require_equal(
+                            "unchanged columns from 0 <= bit_idx <= 15",
+                            meta.query_advice(col, Rotation::cur()),
+                            meta.query_advice(col, Rotation::prev()),
+                        );
+                    }
+                });
+
+                // byte_1 is the accumulation of bit_value_acc_1.
+                cb.condition(is_bit_idx_eq_8, |cb| {
+                    cb.require_equal(
+                        "if bit_index == 8: byte_1 == bit_value_acc_1",
+                        meta.query_advice(table.byte_1, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc_1, Rotation::cur()),
+                    );
+                });
+
+                // byte_2 is the accumulation of bit_value_acc_2.
+                cb.condition(is_last, |cb| {
+                    cb.require_equal(
+                        "if bit_index == 15: byte_2 == bit_value_acc_2",
+                        meta.query_advice(table.byte_2, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc_2, Rotation::cur()),
+                    );
+                });
+
+                cb.gate(meta.query_fixed(q_enabled, Rotation::cur()))
+            },
+        );
+
+        // Consider a bit chunk from bit_index == 4 to bit_index == 9. We will have:
+        //
+        // | bit index | from start | until end | bitstring len | bit | bit value acc |
+        // |-----------|------------|-----------|---------------|-----|---------------|
+        // | 0         | 1          | 0         | 0             | 0   | 0             |
+        // | 1         | 1          | 0         | 0             | 0   | 0             |
+        // | 2         | 1          | 0         | 0             | 1   | 0             |
+        // | 3         | 1          | 0         | 0             | 0   | 0             |
+        // | 4      -> | 1          | 1         | 1             | 1   | 1             |
+        // | 5      -> | 1          | 1         | 2             | 0   | 1             |
+        // | 6      -> | 1          | 1         | 3             | 1   | 5             |
+        // | 7      -> | 1          | 1         | 4             | 1   | 13            |
+        // | 8      -> | 1          | 1         | 5             | 0   | 13            |
+        // | 9      -> | 1          | 1         | 6             | 1   | 45            |
+        // | 10        | 0          | 1         | 6             | 0   | 45            |
+        // | 11        | 0          | 1         | 6             | 0   | 45            |
+        // | 12        | 0          | 1         | 6             | 0   | 45            |
+        // | 13        | 0          | 1         | 6             | 1   | 45            |
+        // | 14        | 0          | 1         | 6             | 1   | 45            |
+        // | 15        | 0          | 1         | 6             | 0   | 45            |
+        //
+        // The bits for the bitstring are where from_start == until_end == 1.
+        meta.create_gate(
+            "HuffmanCodesBitstringAccumulationTable: bit value",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
+
+                // Columns from_start and until_end are boolean.
+                cb.require_boolean(
+                    "from_start is boolean",
+                    meta.query_advice(table.from_start, Rotation::cur()),
+                );
+                cb.require_boolean(
+                    "until_end is boolean",
+                    meta.query_advice(table.until_end, Rotation::cur()),
+                );
+
+                // Column from_start transitions from 1 to 0 only once.
+                let is_first = meta.query_fixed(table.q_first, Rotation::cur());
+                cb.condition(is_first.expr(), |cb| {
+                    cb.require_equal(
+                        "if q_first == True: from_start == 1",
+                        meta.query_advice(table.from_start, Rotation::cur()),
+                        1.expr(),
+                    );
+                });
+                cb.condition(not::expr(is_first.expr()), |cb| {
+                    cb.require_boolean(
+                        "from_start transitions from 1 to 0 only once",
+                        meta.query_advice(table.from_start, Rotation::prev())
+                            - meta.query_advice(table.from_start, Rotation::cur()),
+                    );
+                });
+
+                // Column until_end transitions from 0 to 1 only once.
+                let is_last = meta.query_fixed(table.q_first, Rotation::next());
+                cb.condition(is_last.expr(), |cb| {
+                    cb.require_equal(
+                        "if q_first::next == True: until_end == 1",
+                        meta.query_advice(table.until_end, Rotation::cur()),
+                        1.expr(),
+                    );
+                });
+                cb.condition(not::expr(is_last.expr()), |cb| {
+                    cb.require_boolean(
+                        "until_end transitions from 0 to 1 only once",
+                        meta.query_advice(table.until_end, Rotation::next())
+                            - meta.query_advice(table.until_end, Rotation::cur()),
+                    );
+                });
+
+                // Constraints at meaningful bits.
+                let is_set = and::expr([
+                    meta.query_advice(table.from_start, Rotation::cur()),
+                    meta.query_advice(table.until_end, Rotation::cur()),
+                ]);
+                cb.condition(is_first.expr() * is_set.expr(), |cb| {
+                    cb.require_equal(
+                        "if is_first && is_set: bit == bit_value_acc",
+                        meta.query_advice(table.bit, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc, Rotation::cur()),
+                    );
+                    cb.require_equal(
+                        "if is_first && is_set: bitstring_len == 1",
+                        meta.query_advice(table.bitstring_len, Rotation::cur()),
+                        1.expr(),
+                    );
+                });
+                cb.condition(not::expr(is_first) * is_set, |cb| {
+                    cb.require_equal(
+                        "is_set: bit_value_acc == bit_value_acc::prev * 2 + bit",
+                        meta.query_advice(table.bit_value_acc, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc, Rotation::prev()) * 2.expr()
+                            + meta.query_advice(table.bit, Rotation::cur()),
+                    );
+                    cb.require_equal(
+                        "is_set: bitstring_len == bitstring_len::prev + 1",
+                        meta.query_advice(table.bitstring_len, Rotation::cur()),
+                        meta.query_advice(table.bitstring_len, Rotation::prev()) + 1.expr(),
+                    );
+                });
+
+                // Constraints at bits to be ignored (at the start).
+                let is_ignored = not::expr(meta.query_advice(table.until_end, Rotation::cur()));
+                cb.condition(is_ignored, |cb| {
+                    cb.require_zero(
+                        "while until_end == 0: bitstring_len == 0",
+                        meta.query_advice(table.bitstring_len, Rotation::cur()),
+                    );
+                    cb.require_zero(
+                        "while until_end == 0: bit_value_acc == 0",
+                        meta.query_advice(table.bit_value_acc, Rotation::cur()),
+                    );
+                });
+
+                // Constraints at bits to be ignored (towards the end).
+                let is_ignored = not::expr(meta.query_advice(table.from_start, Rotation::cur()));
+                cb.condition(is_ignored, |cb| {
+                    cb.require_equal(
+                        "bitstring_len unchanged at the last ignored bits",
+                        meta.query_advice(table.bitstring_len, Rotation::cur()),
+                        meta.query_advice(table.bitstring_len, Rotation::prev()),
+                    );
+                    cb.require_equal(
+                        "bit_value_acc unchanged at the last ignored bits",
+                        meta.query_advice(table.bit_value_acc, Rotation::cur()),
+                        meta.query_advice(table.bit_value_acc, Rotation::prev()),
+                    );
+                });
+
+                cb.gate(meta.query_fixed(table.q_enabled, Rotation::cur()))
+            },
+        );
 
         table
     }
