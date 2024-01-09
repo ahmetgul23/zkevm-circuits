@@ -2,6 +2,7 @@ use array_init::array_init;
 use eth_types::Field;
 use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
+    comparator::{ComparatorChip, ComparatorConfig},
     is_equal::{IsEqualChip, IsEqualConfig},
     util::{and, not, Expr},
 };
@@ -17,7 +18,7 @@ use crate::{
     witness::{FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS},
 };
 
-use super::{BitwiseOpTable, LookupTable, Pow2Table, RangeTable};
+use super::{BitwiseOpTable, LookupTable, Pow2Table, RangeTable, U8Table};
 
 /// The finite state entropy table in its default view, i.e. when the ``state`` increments.
 ///
@@ -47,7 +48,7 @@ pub struct FseTable<F> {
     /// 1-indexed, i.e. byte_offset == 1 at the first byte.
     pub byte_offset: Column<Advice>,
     /// Helper gadget to know when we are done handling a single canonical Huffman code.
-    pub byte_offset_eq: IsEqualConfig<F>,
+    pub byte_offset_cmp: ComparatorConfig<F, 8>,
     /// The size of the FSE table that starts at byte_offset.
     pub table_size: Column<Advice>,
     /// Incremental index for this specific FSE table.
@@ -65,7 +66,11 @@ pub struct FseTable<F> {
 }
 
 impl<F: Field> FseTable<F> {
-    pub fn construct(meta: &mut ConstraintSystem<F>, aux_table: FseAuxiliaryTable<F>) -> Self {
+    pub fn construct(
+        meta: &mut ConstraintSystem<F>,
+        aux_table: FseAuxiliaryTable<F>,
+        u8_table: U8Table,
+    ) -> Self {
         let q_enabled = meta.fixed_column();
         let byte_offset = meta.advice_column();
         let table = Self {
@@ -73,11 +78,12 @@ impl<F: Field> FseTable<F> {
             instance_idx: meta.advice_column(),
             frame_idx: meta.advice_column(),
             byte_offset,
-            byte_offset_eq: IsEqualChip::configure(
+            byte_offset_cmp: ComparatorChip::configure(
                 meta,
                 |meta| meta.query_fixed(q_enabled, Rotation::cur()),
                 |meta| meta.query_advice(byte_offset, Rotation::cur()),
                 |meta| meta.query_advice(byte_offset, Rotation::next()),
+                u8_table.into(),
             ),
             table_size: meta.advice_column(),
             idx: meta.advice_column(),
@@ -87,7 +93,15 @@ impl<F: Field> FseTable<F> {
             nb: meta.advice_column(),
         };
 
-        // TODO: byte_offset' >= byte_offset.
+        // Constraints common to all rows.
+        meta.create_gate("FseTable: all rows", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            let (gt, eq) = table.byte_offset_cmp.expr(meta, None);
+            cb.require_equal("byte offset is increasing", gt + eq, 1.expr());
+
+            cb.gate(meta.query_fixed(table.q_enabled, Rotation::cur()))
+        });
 
         // Constraints while we are in the same instance of FseTable.
         meta.create_gate("FseTable: while traversing the same table", |meta| {
@@ -114,9 +128,10 @@ impl<F: Field> FseTable<F> {
                 meta.query_advice(table.state, Rotation::cur()) + 1.expr(),
             );
 
+            let (_byte_offset_changed, byte_offset_eq) = table.byte_offset_cmp.expr(meta, None);
             cb.gate(and::expr([
                 meta.query_fixed(table.q_enabled, Rotation::cur()),
-                table.byte_offset_eq.expr(),
+                byte_offset_eq,
             ]))
         });
 
@@ -138,9 +153,10 @@ impl<F: Field> FseTable<F> {
                 meta.query_advice(table.table_size, Rotation::cur()),
             );
 
+            let (byte_offset_changed, _byte_offset_eq) = table.byte_offset_cmp.expr(meta, None);
             cb.gate(and::expr([
                 meta.query_fixed(q_enabled, Rotation::cur()),
-                not::expr(table.byte_offset_eq.expr()),
+                byte_offset_changed,
             ]))
         });
 
@@ -234,7 +250,7 @@ pub struct FseAuxiliaryTable<F> {
     /// 1-indexed, i.e. byte_offset == 1 at the first byte.
     pub byte_offset: Column<Advice>,
     /// Helper gadget to know when we are done handling a single canonical Huffman code.
-    pub byte_offset_eq: IsEqualConfig<F>,
+    pub byte_offset_cmp: ComparatorConfig<F, 8>,
     /// The size of the FSE table that starts at byte_offset.
     pub table_size: Column<Advice>,
     /// Helper column for (table_size >> 1).
@@ -283,6 +299,7 @@ impl<F: Field> FseAuxiliaryTable<F> {
         bitwise_op_table: BitwiseOpTable,
         pow2_table: Pow2Table,
         range_table: RangeTable<8>,
+        u8_table: U8Table,
     ) -> Self {
         let q_enabled = meta.fixed_column();
         let byte_offset = meta.advice_column();
@@ -294,11 +311,12 @@ impl<F: Field> FseAuxiliaryTable<F> {
             instance_idx: meta.advice_column(),
             frame_idx: meta.advice_column(),
             byte_offset,
-            byte_offset_eq: IsEqualChip::configure(
+            byte_offset_cmp: ComparatorChip::configure(
                 meta,
                 |meta| meta.query_fixed(q_enabled, Rotation::cur()),
                 |meta| meta.query_advice(byte_offset, Rotation::cur()),
                 |meta| meta.query_advice(byte_offset, Rotation::next()),
+                u8_table.into(),
             ),
             table_size: meta.advice_column(),
             table_size_rs_1: meta.advice_column(),
@@ -323,8 +341,6 @@ impl<F: Field> FseAuxiliaryTable<F> {
             baseline_mark: meta.advice_column(),
         };
 
-        // TODO: byte_offset' >= byte_offset.
-
         // All rows.
         meta.create_gate("FseAuxiliaryTable: all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
@@ -334,7 +350,24 @@ impl<F: Field> FseAuxiliaryTable<F> {
                 meta.query_advice(table.baseline_mark, Rotation::cur()),
             );
 
+            let (gt, eq) = table.byte_offset_cmp.expr(meta, None);
+            cb.require_equal("byte offset is increasing", gt + eq, 1.expr());
+
             cb.gate(meta.query_fixed(table.q_enabled, Rotation::cur()))
+        });
+
+        // Validate SPoT assignment: all rows.
+        meta.lookup_any("FseAuxiliaryTable: SPoT == 2 ^ Nb", |meta| {
+            let condition = meta.query_fixed(table.q_enabled, Rotation::cur());
+
+            [
+                meta.query_advice(table.nb, Rotation::cur()),
+                meta.query_advice(table.spot, Rotation::cur()),
+            ]
+            .into_iter()
+            .zip(pow2_table.table_exprs(meta))
+            .map(|(input, table)| (input * condition.clone(), table))
+            .collect::<Vec<_>>()
         });
 
         // Constraints while traversing an FSE table.
@@ -367,24 +400,11 @@ impl<F: Field> FseAuxiliaryTable<F> {
                     - meta.query_advice(table.symbol, Rotation::cur()),
             );
 
+            let (_gt, eq) = table.byte_offset_cmp.expr(meta, None);
             cb.gate(and::expr([
                 meta.query_fixed(table.q_enabled, Rotation::cur()),
-                table.byte_offset_eq.expr(),
+                eq,
             ]))
-        });
-
-        // Validate SPoT assignment.
-        meta.lookup_any("FseAuxiliaryTable: SPoT == 2 ^ Nb", |meta| {
-            let condition = meta.query_fixed(table.q_enabled, Rotation::cur());
-
-            [
-                meta.query_advice(table.nb, Rotation::cur()),
-                meta.query_advice(table.spot, Rotation::cur()),
-            ]
-            .into_iter()
-            .zip(pow2_table.table_exprs(meta))
-            .map(|(input, table)| (input * condition.clone(), table))
-            .collect::<Vec<_>>()
         });
 
         // Constraints for last row of an FSE table.
@@ -405,18 +425,17 @@ impl<F: Field> FseAuxiliaryTable<F> {
                 meta.query_advice(table.table_size, Rotation::cur()),
             );
 
+            let (gt, _eq) = table.byte_offset_cmp.expr(meta, None);
             cb.gate(and::expr([
                 meta.query_fixed(q_enabled, Rotation::cur()),
-                not::expr(table.byte_offset_eq.expr()),
+                gt,
             ]))
         });
 
         // Constraint for table_size >> 3. Only check on the last row.
         meta.lookup("FseAuxiliaryTable: table shift right ops", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(q_enabled, Rotation::cur()),
-                not::expr(table.byte_offset_eq.expr()),
-            ]);
+            let (gt, _eq) = table.byte_offset_cmp.expr(meta, None);
+            let condition = and::expr([meta.query_fixed(q_enabled, Rotation::cur()), gt]);
 
             let range_value = meta.query_advice(table.table_size, Rotation::cur())
                 - (meta.query_advice(table.table_size_rs_3, Rotation::cur()) * 8.expr());
@@ -429,10 +448,8 @@ impl<F: Field> FseAuxiliaryTable<F> {
         // - state' == state'' & (table_size - 1)
         // - state'' == state + (table_size >> 3) + (table_size >> 1) + 3
         meta.lookup_any("FseAuxiliaryTable: next state computation", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(table.q_enabled, Rotation::cur()),
-                table.byte_offset_eq.expr(),
-            ]);
+            let (_gt, eq) = table.byte_offset_cmp.expr(meta, None);
+            let condition = and::expr([meta.query_fixed(table.q_enabled, Rotation::cur()), eq]);
 
             let lhs = meta.query_advice(table.state, Rotation::cur())
                 + meta.query_advice(table.table_size_rs_3, Rotation::cur())
@@ -513,9 +530,10 @@ impl<F: Field> FseAuxiliaryTable<F> {
                 );
             });
 
+            let (_gt, byte_offset_eq) = table.byte_offset_cmp.expr(meta, None);
             cb.gate(and::expr([
                 meta.query_fixed(table.q_enabled, Rotation::cur()),
-                table.byte_offset_eq.expr(),
+                byte_offset_eq,
                 table.symbol_eq.expr(),
             ]))
         });
