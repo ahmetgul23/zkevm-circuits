@@ -2,12 +2,13 @@ use array_init::array_init;
 use eth_types::Field;
 use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
-    comparator::{ComparatorChip, ComparatorConfig},
+    comparator::{ComparatorChip, ComparatorConfig, ComparatorInstruction},
     is_equal::{IsEqualChip, IsEqualConfig},
     util::{and, not, Expr},
 };
 use halo2_proofs::{
-    plonk::{Advice, Any, Column, ConstraintSystem, Expression, Fixed, VirtualCells},
+    circuit::{Layouter, Value},
+    plonk::{Advice, Any, Column, ConstraintSystem, Error, Expression, Fixed, VirtualCells},
     poly::Rotation,
 };
 use strum::IntoEnumIterator;
@@ -15,7 +16,7 @@ use strum::IntoEnumIterator;
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::BitwiseOp,
-    witness::{FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS},
+    witness::{FseAuxiliaryData, FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS},
 };
 
 use super::{BitwiseOpTable, LookupTable, Pow2Table, RangeTable, U8Table};
@@ -66,6 +67,7 @@ pub struct FseTable<F> {
 }
 
 impl<F: Field> FseTable<F> {
+    /// Construct the FSE table with its columns constrained.
     pub fn construct(
         meta: &mut ConstraintSystem<F>,
         aux_table: FseAuxiliaryTable<F>,
@@ -186,6 +188,114 @@ impl<F: Field> FseTable<F> {
         debug_assert!(meta.degree() <= 9);
 
         table
+    }
+
+    /// Dev mode: load witness to the FSE table.
+    pub fn dev_load(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        data: Vec<FseAuxiliaryData>,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "FseTable: dev",
+            |mut region| {
+                let mut offset = 0;
+                for fse_table in data.iter() {
+                    let instance_idx = Value::known(F::from(fse_table.instance_idx));
+                    let frame_idx = Value::known(F::from(fse_table.frame_idx));
+                    let byte_offset = Value::known(F::from(fse_table.byte_offset));
+                    let table_size = Value::known(F::from(fse_table.table_size));
+                    for row in fse_table.data.iter() {
+                        for (annotation, column, value) in [
+                            ("instance_idx", self.instance_idx, instance_idx),
+                            ("frame_idx", self.frame_idx, frame_idx),
+                            ("byte_offset", self.byte_offset, byte_offset),
+                            ("table_size", self.table_size, table_size),
+                            ("idx", self.idx, Value::known(row.idx.into())),
+                            ("state", self.state, Value::known(F::from(row.state as u64))),
+                            (
+                                "symbol",
+                                self.symbol,
+                                Value::known(F::from(row.symbol as u64)),
+                            ),
+                            (
+                                "baseline",
+                                self.baseline,
+                                Value::known(F::from(row.baseline as u64)),
+                            ),
+                            ("nb", self.nb, Value::known(F::from(row.num_bits as u64))),
+                        ] {
+                            region.assign_advice(
+                                || format!("FseTable(dev): {annotation}"),
+                                column,
+                                offset,
+                                || value,
+                            )?;
+                        }
+
+                        offset += 1;
+                    }
+                }
+
+                let cmp_chip = ComparatorChip::construct(self.byte_offset_cmp.clone());
+                offset = 0;
+
+                // if there is a single table.
+                if data.len() == 1 {
+                    let byte_offset = data[0].byte_offset;
+                    for _ in 0..byte_offset - 1 {
+                        cmp_chip.assign(
+                            &mut region,
+                            offset,
+                            F::from(byte_offset),
+                            F::from(byte_offset),
+                        )?;
+                        offset += 1;
+                    }
+                    cmp_chip.assign(&mut region, offset, F::from(byte_offset), F::zero())?;
+                }
+
+                // if there are multiple tables.
+                if data.len() > 1 {
+                    for window in data.windows(2) {
+                        let byte_offset_1 = window[0].byte_offset;
+                        let byte_offset_2 = window[1].byte_offset;
+                        for _ in 0..byte_offset_1 - 1 {
+                            cmp_chip.assign(
+                                &mut region,
+                                offset,
+                                F::from(byte_offset_1),
+                                F::from(byte_offset_1),
+                            )?;
+                            offset += 1;
+                        }
+                        cmp_chip.assign(
+                            &mut region,
+                            offset,
+                            F::from(byte_offset_1),
+                            F::from(byte_offset_2),
+                        )?;
+                        offset += 1;
+                    }
+                    // handle the last table.
+                    if let Some(last_table) = data.last() {
+                        let byte_offset = last_table.byte_offset;
+                        for _ in 0..byte_offset - 1 {
+                            cmp_chip.assign(
+                                &mut region,
+                                offset,
+                                F::from(byte_offset),
+                                F::from(byte_offset),
+                            )?;
+                            offset += 1;
+                        }
+                        cmp_chip.assign(&mut region, offset, F::from(byte_offset), F::zero())?;
+                    }
+                }
+
+                Ok(())
+            },
+        )
     }
 }
 

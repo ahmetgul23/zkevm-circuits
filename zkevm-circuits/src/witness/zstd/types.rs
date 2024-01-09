@@ -152,13 +152,34 @@ pub struct HuffmanData {
     pub k: (u8, u8),
 }
 
+/// Witness to the FseTable.
 #[derive(Clone, Debug, Default)]
 pub struct FseData {
+    /// Incremental index, starting at 1.
     pub idx: u64,
+    /// The FSE state at this row in the FSE table.
     pub state: u8,
+    /// The baseline associated with this state.
     pub baseline: u8,
+    /// The number of bits to be read from the input bitstream at this state.
     pub num_bits: u8,
+    /// The symbol emitted by the FSE table at this state.
     pub symbol: u8,
+}
+
+/// Auxiliary data accompanying the FSE table's witness values.
+#[derive(Clone, Debug)]
+pub struct FseAuxiliaryData {
+    /// The instance ID assigned to the data we are encoding using zstd.
+    pub instance_idx: u64,
+    /// The frame ID we are currently decoding.
+    pub frame_idx: u64,
+    /// The byte offset in the frame at which the FSE table is described.
+    pub byte_offset: u64,
+    /// The FSE table's size, i.e. 1 << AL (accuracy log).
+    pub table_size: u64,
+    /// The data representing the states, symbols, and so on of this FSE table.
+    pub data: Vec<FseData>,
 }
 
 #[derive(Clone, Debug)]

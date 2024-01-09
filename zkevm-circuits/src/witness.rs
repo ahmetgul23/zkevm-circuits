@@ -38,4 +38,4 @@ mod tx;
 pub use tx::Transaction;
 
 mod zstd;
-pub use zstd::{FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS};
+pub use zstd::{FseAuxiliaryData, FseData, FseSymbol, N_BITS_SYMBOL, N_MAX_SYMBOLS};
