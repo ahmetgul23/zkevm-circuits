@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use eth_types::Field;
 use gadgets::impl_expr;
 use halo2_proofs::{circuit::Value, plonk::Expression};
@@ -31,6 +33,22 @@ impl_expr!(FseSymbol);
 impl From<FseSymbol> for usize {
     fn from(value: FseSymbol) -> Self {
         value as usize
+    }
+}
+
+impl From<usize> for FseSymbol {
+    fn from(value: usize) -> Self {
+        match value {
+            0 => Self::S0,
+            1 => Self::S1,
+            2 => Self::S2,
+            3 => Self::S3,
+            4 => Self::S4,
+            5 => Self::S5,
+            6 => Self::S6,
+            7 => Self::S7,
+            _ => unreachable!("FseSymbol in [0, 8)"),
+        }
     }
 }
 
@@ -150,6 +168,90 @@ pub struct HuffmanData {
     pub byte_offset: u64,
     pub bit_value: u8,
     pub k: (u8, u8),
+}
+
+/// Witness to the HuffmanCodesTable.
+#[derive(Clone, Debug)]
+pub struct HuffmanCodesData {
+    /// The instance ID assigned to the data we are encoding using zstd.
+    pub instance_idx: u64,
+    /// The frame ID we are currently decoding.
+    pub frame_idx: u64,
+    /// The byte offset in the frame at which the FSE table is described.
+    pub byte_offset: u64,
+    /// A mapping of symbol to the weight assigned to it as per canonical Huffman coding. The
+    /// symbol is the raw byte that is encoded using a Huffman code and the weight assigned to it
+    /// is a symbol emitted by the corresponding FSE table.
+    pub weights: Vec<FseSymbol>,
+}
+
+/// Denotes the tuple (max_bitstring_len, Map<symbol, (weight, bit_value)>).
+type ParsedCanonicalHuffmanCode = (u64, BTreeMap<u64, (u64, u64)>);
+
+impl HuffmanCodesData {
+    /// Reconstruct the bitstrings for each symbol based on the canonical Huffman code weights. The
+    /// returned value is tuple of max bitstring length and a map from symbol to its weight and bit
+    /// value.
+    pub fn parse_canonical(&self) -> ParsedCanonicalHuffmanCode {
+        let sum_weights: u64 = self
+            .weights
+            .iter()
+            .map(|&weight| {
+                let weight: usize = weight.into();
+                if weight > 0 {
+                    1 << (weight - 1)
+                } else {
+                    0
+                }
+            })
+            .sum();
+
+        // Helper function to get the number of bits needed to represent a u32 value in binary
+        // form.
+        let bit_length = |value: u64| -> u64 {
+            if value == 0 {
+                0
+            } else {
+                64 - value.leading_zeros() as u64
+            }
+        };
+
+        // Calculate the last symbol's weight and append it.
+        let max_bitstring_len = bit_length(sum_weights);
+        let nearest_pow2 = 1 << max_bitstring_len;
+        let last_weight = ((nearest_pow2 - sum_weights) as f64).log2() as u64;
+        let weights = self
+            .weights
+            .iter()
+            .map(|&weight| weight as u64)
+            .chain(std::iter::once(last_weight))
+            .collect::<Vec<u64>>();
+
+        let mut sym_to_tuple = BTreeMap::new();
+        let mut bit_value = 0;
+        for l in (0..=max_bitstring_len).rev() {
+            bit_value = (bit_value + 1) >> 1;
+            weights
+                .iter()
+                .enumerate()
+                .filter(|(_symbol, &weight)| max_bitstring_len - weight + 1 == l)
+                .for_each(|(symbol, &weight)| {
+                    sym_to_tuple.insert(symbol as u64, (weight, bit_value));
+                    bit_value += 1;
+                });
+        }
+
+        // populate symbols that don't occur in the Huffman code.
+        weights
+            .iter()
+            .enumerate()
+            .filter(|(_, &weight)| weight == 0)
+            .for_each(|(sym, _)| {
+                sym_to_tuple.insert(sym as u64, (0, 0));
+            });
+
+        (max_bitstring_len, sym_to_tuple)
+    }
 }
 
 /// Witness to the FseTable.
