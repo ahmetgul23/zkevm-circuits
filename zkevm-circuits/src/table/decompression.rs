@@ -16,7 +16,7 @@ use strum::IntoEnumIterator;
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::BitwiseOp,
-    witness::{FseAuxiliaryData, FseSymbol, HuffmanCodesData, N_BITS_SYMBOL, N_MAX_SYMBOLS},
+    witness::{FseSymbol, FseTableData, HuffmanCodesData, N_BITS_SYMBOL, N_MAX_SYMBOLS},
 };
 
 use super::{BitwiseOpTable, LookupTable, Pow2Table, RangeTable, U8Table};
@@ -194,7 +194,7 @@ impl<F: Field> FseTable<F> {
     pub fn dev_load(
         &self,
         layouter: &mut impl Layouter<F>,
-        data: Vec<FseAuxiliaryData>,
+        data: Vec<FseTableData>,
     ) -> Result<(), Error> {
         layouter.assign_region(
             || "FseTable: dev",
@@ -205,7 +205,7 @@ impl<F: Field> FseTable<F> {
                     let frame_idx = Value::known(F::from(fse_table.frame_idx));
                     let byte_offset = Value::known(F::from(fse_table.byte_offset));
                     let table_size = Value::known(F::from(fse_table.table_size));
-                    for row in fse_table.data.iter() {
+                    for row in fse_table.rows.iter() {
                         for (annotation, column, value) in [
                             ("instance_idx", self.instance_idx, instance_idx),
                             ("frame_idx", self.frame_idx, frame_idx),

@@ -3,7 +3,11 @@
 use std::marker::PhantomData;
 
 use eth_types::Field;
-use halo2_proofs::plonk::Expression;
+use gadgets::comparator::ComparatorConfig;
+use halo2_proofs::{
+    circuit::{Layouter, Value},
+    plonk::{Advice, Column, ConstraintSystem, Error, Expression},
+};
 
 use crate::{
     util::{Challenges, SubCircuit, SubCircuitConfig},
@@ -22,13 +26,27 @@ pub struct DecompressionCircuitConfigArgs<F> {
 /// [doclink]: https://www.notion.so/scrollzkp/zstd-in-circuit-decompression-23f8036538e440ebbbc17c69033d36f5?pvs=4
 #[derive(Clone, Debug)]
 pub struct DecompressionCircuitConfig<F> {
+    /// This is an incremental ID given to the input data that we are encoding/decoding.
+    instance_idx: Column<Advice>,
+    /// The index of the frame being decoded. The first frame has a frame_idx == 1.
+    frame_idx: Column<Advice>,
+    /// The index of the byte being processed within the current frame. The first byte has a
+    /// byte_idx == 1. byte_idx follows the relation byte_idx' >= byte_idx. That is, byte_idx is
+    /// increasing, but can repeat over two or more rows if we are decoding bits from the same byte
+    /// over those consecutive rows. For instance, if a Huffman Code bitstring is 2 bits long,
+    /// we might end up decoding on the same byte_idx at the most 4 times.
+    byte_idx: Column<Advice>,
+    /// A helper gadget to check the relation: byte_idx' >= byte_idx. We also need this GTE check
+    /// to know when 2 rows must be identical with their decoded data.
+    byte_idx_cmp: ComparatorConfig<F, 8>,
+
     _data: PhantomData<F>,
 }
 
 impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
     type ConfigArgs = DecompressionCircuitConfigArgs<F>;
 
-    fn new(meta: &mut halo2_proofs::plonk::ConstraintSystem<F>, args: Self::ConfigArgs) -> Self {
+    fn new(meta: &mut ConstraintSystem<F>, args: Self::ConfigArgs) -> Self {
         unimplemented!()
     }
 }
@@ -53,9 +71,9 @@ impl<F: Field> SubCircuit<F> for DecompressionCircuit<F> {
     fn synthesize_sub(
         &self,
         config: &Self::Config,
-        challenges: &Challenges<halo2_proofs::circuit::Value<F>>,
-        layouter: &mut impl halo2_proofs::circuit::Layouter<F>,
-    ) -> Result<(), halo2_proofs::plonk::Error> {
+        challenges: &Challenges<Value<F>>,
+        layouter: &mut impl Layouter<F>,
+    ) -> Result<(), Error> {
         unimplemented!()
     }
 }

@@ -39,5 +39,5 @@ pub use tx::Transaction;
 
 mod zstd;
 pub use zstd::{
-    FseAuxiliaryData, FseData, FseSymbol, HuffmanCodesData, N_BITS_SYMBOL, N_MAX_SYMBOLS,
+    FseSymbol, FseTableData, FseTableRow, HuffmanCodesData, N_BITS_SYMBOL, N_MAX_SYMBOLS,
 };
