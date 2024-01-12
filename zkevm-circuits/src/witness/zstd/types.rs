@@ -337,6 +337,7 @@ impl FseAuxiliaryTableData {
         let mut R = table_size;
         let mut state = 0x00;
         let mut symbol = FseSymbol::S0;
+        let mut idx = 1;
         while R > 0 {
             // number of bits and value read from the variable bit-packed data.
             let (n_bits_read, value) = read_variable_bit_packing(&data, offset, R + 1)?;
@@ -374,9 +375,8 @@ impl FseAuxiliaryTableData {
                     .iter()
                     .zip(nbs.iter())
                     .zip(baselines.iter())
-                    .enumerate()
-                    .map(|(i, ((&state, &nb), &baseline))| FseTableRow {
-                        idx: (i + 1) as u64,
+                    .map(|((&state, &nb), &baseline)| FseTableRow {
+                        idx,
                         state,
                         num_bits: nb,
                         baseline,
@@ -384,6 +384,7 @@ impl FseAuxiliaryTableData {
                     })
                     .collect(),
             );
+            idx += 1;
 
             // update the total number of bits read so far.
             offset += n_bits_read;

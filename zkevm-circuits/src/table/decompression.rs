@@ -16,7 +16,10 @@ use strum::IntoEnumIterator;
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::BitwiseOp,
-    witness::{FseSymbol, FseTableData, HuffmanCodesData, N_BITS_SYMBOL, N_MAX_SYMBOLS},
+    witness::{
+        FseAuxiliaryTableData, FseSymbol, FseTableData, HuffmanCodesData, N_BITS_SYMBOL,
+        N_MAX_SYMBOLS,
+    },
 };
 
 use super::{BitwiseOpTable, LookupTable, Pow2Table, RangeTable, U8Table};
@@ -726,6 +729,94 @@ impl<F: Field> FseAuxiliaryTable<F> {
         debug_assert!(meta.degree() <= 9);
 
         table
+    }
+
+    pub fn dev_load(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        data: Vec<FseAuxiliaryTableData>,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "FseAuxiliaryTable: dev load",
+            |mut region| {
+                let mut offset = 0;
+                for table in data.iter() {
+                    let instance_idx = Value::known(F::from(table.instance_idx));
+                    let frame_idx = Value::known(F::from(table.frame_idx));
+                    let byte_offset = Value::known(F::from(table.byte_offset));
+                    let table_size = Value::known(F::from(table.table_size));
+                    let table_size_rs_1 = Value::known(F::from(table.table_size >> 1));
+                    let table_size_rs_3 = Value::known(F::from(table.table_size >> 3));
+                    for (&symbol, rows) in table.sym_to_states.iter() {
+                        let symbol_count = rows.len() as u64;
+                        let smallest_spot = rows
+                            .iter()
+                            .map(|fse_row| 1 << fse_row.num_bits)
+                            .min()
+                            .expect("symbol should have at least 1 row");
+                        let spot_acc_iter = rows.iter().scan(0, |spot_acc, fse_row| {
+                            *spot_acc += 1 << fse_row.num_bits;
+                            Some(*spot_acc)
+                        });
+                        // TODO: byte_offset_cmp
+                        // TODO: symbol_eq
+                        // TODO: baseline_mark
+                        // TODO: last_baseline
+                        // TODO: q_enabled
+                        for (i, (fse_row, spot_acc)) in rows.iter().zip(spot_acc_iter).enumerate() {
+                            for (annotation, col, value) in [
+                                ("instance_idx", self.instance_idx, instance_idx),
+                                ("frame_idx", self.frame_idx, frame_idx),
+                                ("byte_offset", self.byte_offset, byte_offset),
+                                ("table_size", self.table_size, table_size),
+                                ("table_size_rs_1", self.table_size_rs_1, table_size_rs_1),
+                                ("table_size_rs_3", self.table_size_rs_3, table_size_rs_3),
+                                ("symbol", self.symbol, Value::known(F::from(symbol as u64))),
+                                (
+                                    "symbol_count",
+                                    self.symbol_count,
+                                    Value::known(F::from(symbol_count)),
+                                ),
+                                (
+                                    "symbol_count_acc",
+                                    self.symbol_count_acc,
+                                    Value::known(F::from(i as u64 + 1)),
+                                ),
+                                ("state", self.state, Value::known(F::from(fse_row.state))),
+                                (
+                                    "baseline",
+                                    self.baseline,
+                                    Value::known(F::from(fse_row.baseline)),
+                                ),
+                                ("nb", self.nb, Value::known(F::from(fse_row.num_bits))),
+                                (
+                                    "spot",
+                                    self.spot,
+                                    Value::known(F::from(1 << fse_row.num_bits)),
+                                ),
+                                (
+                                    "smallest_spot",
+                                    self.smallest_spot,
+                                    Value::known(F::from(smallest_spot)),
+                                ),
+                                ("spot_acc", self.spot_acc, Value::known(F::from(spot_acc))),
+                                ("idx", self.idx, Value::known(F::from(fse_row.idx))),
+                            ] {
+                                region.assign_advice(
+                                    || format!("FseAuxiliaryTable: {}", annotation),
+                                    col,
+                                    offset,
+                                    || value,
+                                )?;
+                            }
+                            offset += 1;
+                        }
+                    }
+                }
+
+                Ok(())
+            },
+        )
     }
 }
 
