@@ -26,10 +26,6 @@ pub struct DecompressionCircuitConfigArgs<F> {
 /// [doclink]: https://www.notion.so/scrollzkp/zstd-in-circuit-decompression-23f8036538e440ebbbc17c69033d36f5?pvs=4
 #[derive(Clone, Debug)]
 pub struct DecompressionCircuitConfig<F> {
-    /// This is an incremental ID given to the input data that we are encoding/decoding.
-    instance_idx: Column<Advice>,
-    /// The index of the frame being decoded. The first frame has a frame_idx == 1.
-    frame_idx: Column<Advice>,
     /// The index of the byte being processed within the current frame. The first byte has a
     /// byte_idx == 1. byte_idx follows the relation byte_idx' >= byte_idx. That is, byte_idx is
     /// increasing, but can repeat over two or more rows if we are decoding bits from the same byte
