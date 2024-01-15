@@ -32,7 +32,6 @@ fn process_magic_number<F: Field>(
     );
 
     // MagicNumber appears at the start of a new frame.
-    let frame_idx = last_row.frame_idx + 1;
     let value_rlc_iter =
         MAGIC_NUMBER_BYTES
             .iter()
@@ -60,8 +59,6 @@ fn process_magic_number<F: Field>(
             .zip(value_rlc_iter)
             .map(
                 |(((i, &value_byte), tag_value_acc), value_rlc)| ZstdWitnessRow {
-                    instance_idx: last_row.instance_idx,
-                    frame_idx,
                     state: ZstdState {
                         tag: ZstdTag::MagicNumber,
                         tag_next: ZstdTag::FrameHeaderDescriptor,
@@ -159,8 +156,6 @@ fn process_frame_header<F: Field>(
     (
         byte_offset + 1 + fcs_tag_len,
         std::iter::once(ZstdWitnessRow {
-            instance_idx: last_row.instance_idx,
-            frame_idx: last_row.frame_idx,
             state: ZstdState {
                 tag: ZstdTag::FrameHeaderDescriptor,
                 tag_next: ZstdTag::FrameContentSize,
@@ -194,8 +189,6 @@ fn process_frame_header<F: Field>(
                 .enumerate()
                 .map(
                     |(i, ((&value_byte, tag_value_acc), &value_rlc))| ZstdWitnessRow {
-                        instance_idx: last_row.instance_idx,
-                        frame_idx: last_row.frame_idx,
                         state: ZstdState {
                             tag: ZstdTag::FrameContentSize,
                             tag_next: ZstdTag::BlockHeader,
@@ -326,8 +319,6 @@ fn process_block_header<F: Field>(
             .enumerate()
             .map(
                 |(i, ((&value_byte, tag_value_acc), &value_rlc))| ZstdWitnessRow {
-                    instance_idx: last_row.instance_idx,
-                    frame_idx: last_row.frame_idx,
                     state: ZstdState {
                         tag: ZstdTag::BlockHeader,
                         tag_next,
@@ -407,8 +398,6 @@ fn process_block_raw<F: Field>(
             .map(
                 |(i, (((&value_byte, tag_value_acc), value_rlc), decoded_value_rlc))| {
                     ZstdWitnessRow {
-                        instance_idx: last_row.instance_idx,
-                        frame_idx: last_row.frame_idx,
                         state: ZstdState {
                             tag: ZstdTag::RawBlockBytes,
                             tag_next,
@@ -473,8 +462,6 @@ fn process_block_rle<F: Field>(
             .zip(decoded_value_rlc_iter)
             .enumerate()
             .map(|(i, (value_byte, decoded_value_rlc))| ZstdWitnessRow {
-                instance_idx: last_row.instance_idx,
-                frame_idx: last_row.frame_idx,
                 state: ZstdState {
                     tag: ZstdTag::RleBlockBytes,
                     tag_next,
@@ -546,8 +533,6 @@ fn process_block_zstd_huffman_header<F: Field>(
     (
         byte_offset + 1,
         vec![ZstdWitnessRow {
-            instance_idx: last_row.instance_idx,
-            frame_idx: last_row.frame_idx,
             state: ZstdState {
                 tag: ZstdTag::ZstdBlockHuffmanHeader,
                 tag_next: ZstdTag::ZstdBlockFseCode,

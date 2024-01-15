@@ -46,7 +46,7 @@ pub struct DecompressionCircuitConfig<F> {
 impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
     type ConfigArgs = DecompressionCircuitConfigArgs<F>;
 
-    fn new(meta: &mut ConstraintSystem<F>, args: Self::ConfigArgs) -> Self {
+    fn new(_meta: &mut ConstraintSystem<F>, _args: Self::ConfigArgs) -> Self {
         unimplemented!()
     }
 }
@@ -60,19 +60,19 @@ pub struct DecompressionCircuit<F> {
 impl<F: Field> SubCircuit<F> for DecompressionCircuit<F> {
     type Config = DecompressionCircuitConfig<F>;
 
-    fn new_from_block(block: &Block<F>) -> Self {
+    fn new_from_block(_block: &Block<F>) -> Self {
         unimplemented!()
     }
 
-    fn min_num_rows_block(block: &Block<F>) -> (usize, usize) {
+    fn min_num_rows_block(_block: &Block<F>) -> (usize, usize) {
         unimplemented!()
     }
 
     fn synthesize_sub(
         &self,
-        config: &Self::Config,
-        challenges: &Challenges<Value<F>>,
-        layouter: &mut impl Layouter<F>,
+        _config: &Self::Config,
+        _challenges: &Challenges<Value<F>>,
+        _layouter: &mut impl Layouter<F>,
     ) -> Result<(), Error> {
         unimplemented!()
     }

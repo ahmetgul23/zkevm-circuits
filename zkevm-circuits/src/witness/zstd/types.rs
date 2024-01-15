@@ -186,10 +186,6 @@ pub struct HuffmanData {
 /// Witness to the HuffmanCodesTable.
 #[derive(Clone, Debug)]
 pub struct HuffmanCodesData {
-    /// The instance ID assigned to the data we are encoding using zstd.
-    pub instance_idx: u64,
-    /// The frame ID we are currently decoding.
-    pub frame_idx: u64,
     /// The byte offset in the frame at which the FSE table is described.
     pub byte_offset: u64,
     /// A mapping of symbol to the weight assigned to it as per canonical Huffman coding. The
@@ -275,10 +271,6 @@ pub struct FseTableRow {
 /// Data for the FSE table's witness values.
 #[derive(Clone, Debug)]
 pub struct FseTableData {
-    /// The instance ID assigned to the data we are encoding using zstd.
-    pub instance_idx: u64,
-    /// The frame ID we are currently decoding.
-    pub frame_idx: u64,
     /// The byte offset in the frame at which the FSE table is described.
     pub byte_offset: u64,
     /// The FSE table's size, i.e. 1 << AL (accuracy log).
@@ -290,10 +282,6 @@ pub struct FseTableData {
 /// Auxiliary data accompanying the FSE table's witness values.
 #[derive(Clone, Debug)]
 pub struct FseAuxiliaryTableData {
-    /// The instance ID assigned to the data we are encoding using zstd.
-    pub instance_idx: u64,
-    /// The frame ID we are currently decoding.
-    pub frame_idx: u64,
     /// The byte offset in the frame at which the FSE table is described.
     pub byte_offset: u64,
     /// The FSE table's size, i.e. 1 << AL (accuracy log).
@@ -314,12 +302,7 @@ impl FseAuxiliaryTableData {
     /// with the reconstructed FSE table. After processing the entire bitstream to reconstruct the
     /// FSE table, if the read bitstream was not byte aligned, then we discard the 1..8 bits from
     /// the last byte that we read from.
-    pub fn reconstruct(
-        instance_idx: u64,
-        frame_idx: u64,
-        src: &[u8],
-        byte_offset: usize,
-    ) -> std::io::Result<(usize, Self)> {
+    pub fn reconstruct(src: &[u8], byte_offset: usize) -> std::io::Result<(usize, Self)> {
         // construct little-endian bit-reader.
         let data = src.iter().skip(byte_offset).cloned().collect::<Vec<u8>>();
         let mut reader = BitReader::endian(Cursor::new(&data), LittleEndian);
@@ -406,8 +389,6 @@ impl FseAuxiliaryTableData {
         Ok((
             t,
             Self {
-                instance_idx,
-                frame_idx,
                 byte_offset: byte_offset as u64,
                 table_size,
                 sym_to_states,
@@ -418,8 +399,6 @@ impl FseAuxiliaryTableData {
 
 #[derive(Clone, Debug)]
 pub struct ZstdWitnessRow<F> {
-    pub instance_idx: u64,
-    pub frame_idx: u64,
     pub state: ZstdState<F>,
     pub encoded_data: EncodedData<F>,
     pub decoded_data: DecodedData<F>,
@@ -430,8 +409,6 @@ pub struct ZstdWitnessRow<F> {
 impl<F: Field> ZstdWitnessRow<F> {
     pub fn init(src_len: usize) -> Self {
         Self {
-            instance_idx: 1,
-            frame_idx: 0,
             state: ZstdState::default(),
             encoded_data: EncodedData {
                 encoded_len: src_len as u64,
