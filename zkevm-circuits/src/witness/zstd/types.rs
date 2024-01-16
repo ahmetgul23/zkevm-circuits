@@ -82,24 +82,49 @@ impl From<u8> for BlockType {
     }
 }
 
+/// Various tags that we can decode from a zstd encoded data.
 #[derive(Clone, Copy, Debug, EnumIter)]
 pub enum ZstdTag {
+    /// Null should not occur.
     Null = 0,
+    /// Magic number bytes.
     MagicNumber,
+    /// The frame header's descriptor.
     FrameHeaderDescriptor,
+    /// The frame's content size.
     FrameContentSize,
+    /// The block's header.
     BlockHeader,
+    /// Raw bytes.
     RawBlockBytes,
+    /// Run-length encoded bytes.
     RleBlockBytes,
+    /// Zstd block's literals header.
     ZstdBlockLiteralsHeader,
+    /// Zstd block's huffman header.
     ZstdBlockHuffmanHeader,
+    /// Zstd block's FSE code.
     ZstdBlockFseCode,
+    /// Zstd block's huffman code.
     ZstdBlockHuffmanCode,
+    /// Zstd block's jump table.
     ZstdBlockJumpTable,
+    /// Literal stream 1.
     Lstream1,
+    /// Literal stream 2.
     Lstream2,
+    /// Literal stream 3.
     Lstream3,
+    /// Literal stream 4.
     Lstream4,
+}
+
+impl_expr!(ZstdTag);
+
+impl From<ZstdTag> for usize {
+    fn from(value: ZstdTag) -> Self {
+        value as usize
+    }
 }
 
 impl ToString for ZstdTag {
@@ -433,7 +458,7 @@ mod tests {
         // other bytes are garbage (for the purpose of this test case), and we want to make
         // sure FSE reconstruction ignores them.
         let src = vec![0xff, 0xff, 0xff, 0x30, 0x6f, 0x9b, 0x03, 0xff, 0xff, 0xff];
-        let (n_bytes, table) = FseAuxiliaryTableData::reconstruct(1, 1, &src, 3)?;
+        let (n_bytes, table) = FseAuxiliaryTableData::reconstruct(&src, 3)?;
 
         // TODO: assert equality for the entire table.
         // for now only comparing state/baseline/nb for S1, i.e. weight == 1.
