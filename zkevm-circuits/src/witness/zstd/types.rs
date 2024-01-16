@@ -109,14 +109,8 @@ pub enum ZstdTag {
     ZstdBlockHuffmanCode,
     /// Zstd block's jump table.
     ZstdBlockJumpTable,
-    /// Literal stream 1.
-    Lstream1,
-    /// Literal stream 2.
-    Lstream2,
-    /// Literal stream 3.
-    Lstream3,
-    /// Literal stream 4.
-    Lstream4,
+    /// Literal stream.
+    Lstream,
 }
 
 impl_expr!(ZstdTag);
@@ -142,10 +136,7 @@ impl ToString for ZstdTag {
             Self::ZstdBlockFseCode => "ZstdBlockFseCode",
             Self::ZstdBlockHuffmanCode => "ZstdBlockHuffmanCode",
             Self::ZstdBlockJumpTable => "ZstdBlockJumpTable",
-            Self::Lstream1 => "Lstream1",
-            Self::Lstream2 => "Lstream2",
-            Self::Lstream3 => "Lstream3",
-            Self::Lstream4 => "Lstream4",
+            Self::Lstream => "Lstream",
         })
     }
 }
