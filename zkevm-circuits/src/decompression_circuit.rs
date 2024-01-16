@@ -184,7 +184,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         is_tag!(is_zb_fse_code, ZstdBlockFseCode);
         is_tag!(is_zb_huffman_code, ZstdBlockHuffmanCode);
         is_tag!(is_zb_jump_table, ZstdBlockJumpTable);
-        is_tag!(is_lstream, Lstream);
+        is_tag!(is_zb_lstream, Lstream);
 
         meta.create_gate("DecompressionCircuit: all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
@@ -295,6 +295,12 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 1.expr(),
             );
 
+            cb.require_equal(
+                "tag == MagicNumber",
+                meta.query_advice(tag_gadget.tag, Rotation::cur()),
+                ZstdTag::MagicNumber.expr(),
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 meta.query_fixed(q_first, Rotation::cur()),
@@ -321,6 +327,150 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         });
 
         debug_assert!(meta.degree() <= 9);
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////////// ZstdTag::MagicNumber //////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: MagicNumber", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_magic_number(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////// ZstdTag::FrameHeaderDescriptor /////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: FrameHeaderDescriptor", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_frame_header_descriptor(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////// ZstdTag::FrameContentSize ////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: FrameContentSize", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_frame_content_size(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////// ZstdTag::BlockHeader ///////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: BlockHeader", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_block_header(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////// ZstdTag::RawBlock ////////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: RawBlock", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_raw_block(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////////// ZstdTag::RleBlock ////////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: RleBlock", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_rle_block(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        ///////////////////////////// ZstdTag::ZstdBlockLiteralsHeader ////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlockLiteralsHeader", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_literals_header(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        ///////////////////////////// ZstdTag::ZstdBlockHuffmanHeader /////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlockHuffmanHeader", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_huffman_header(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        ///////////////////////////////// ZstdTag::ZstdBlockFseCode ///////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlockFseCode", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_fse_code(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////// ZstdTag::ZstdBlockHuffmanCode /////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlockHuffmanCode", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_huffman_code(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////////// ZstdTag::ZstdBlockJumpTable ///////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlockJumpTable", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_jump_table(meta),
+            ]))
+        });
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        //////////////////////////////// ZstdTag::ZstdBlockLstream ////////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlockLstream", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_lstream(meta),
+            ]))
+        });
 
         Self {
             q_enable,
