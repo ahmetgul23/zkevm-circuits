@@ -1,3 +1,4 @@
+/// Number of bits to represent a byte.
 pub const N_BITS_PER_BYTE: usize = 8;
 
 pub const N_BLOCK_HEADER_BYTES: usize = 3;
