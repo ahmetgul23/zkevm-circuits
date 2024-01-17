@@ -15,74 +15,6 @@ use tui::draw_rows;
 mod util;
 use util::value_bits_le;
 
-/// MagicNumber
-fn process_magic_number<F: Field>(
-    src: &[u8],
-    byte_offset: usize,
-    last_row: &ZstdWitnessRow<F>,
-    randomness: Value<F>,
-) -> (usize, Vec<ZstdWitnessRow<F>>) {
-    assert_eq!(
-        src.iter()
-            .skip(byte_offset)
-            .take(N_MAGIC_NUMBER_BYTES)
-            .cloned()
-            .collect::<Vec<u8>>(),
-        MAGIC_NUMBER_BYTES.to_vec(),
-    );
-
-    // MagicNumber appears at the start of a new frame.
-    let value_rlc_iter =
-        MAGIC_NUMBER_BYTES
-            .iter()
-            .scan(last_row.encoded_data.value_rlc, |acc, &byte| {
-                *acc = *acc * randomness + Value::known(F::from(byte as u64));
-                Some(*acc)
-            });
-    let tag_value_iter = MAGIC_NUMBER_BYTES
-        .iter()
-        .scan(Value::known(F::zero()), |acc, &byte| {
-            *acc = *acc * randomness + Value::known(F::from(byte as u64));
-            Some(*acc)
-        });
-    let tag_value = tag_value_iter
-        .clone()
-        .last()
-        .expect("no items in MAGIC_NUMBER_BYTES");
-    (
-        byte_offset + N_MAGIC_NUMBER_BYTES,
-        src.iter()
-            .skip(byte_offset)
-            .take(N_MAGIC_NUMBER_BYTES)
-            .enumerate()
-            .zip(tag_value_iter)
-            .zip(value_rlc_iter)
-            .map(
-                |(((i, &value_byte), tag_value_acc), value_rlc)| ZstdWitnessRow {
-                    state: ZstdState {
-                        tag: ZstdTag::MagicNumber,
-                        tag_next: ZstdTag::FrameHeaderDescriptor,
-                        tag_len: N_MAGIC_NUMBER_BYTES as u64,
-                        tag_idx: (i + 1) as u64,
-                        tag_value,
-                        tag_value_acc,
-                    },
-                    encoded_data: EncodedData {
-                        byte_idx: (byte_offset + i + 1) as u64,
-                        encoded_len: last_row.encoded_data.encoded_len,
-                        value_byte,
-                        value_rlc,
-                        ..Default::default()
-                    },
-                    decoded_data: last_row.decoded_data.clone(),
-                    huffman_data: HuffmanData::default(),
-                    fse_data: FseTableRow::default(),
-                },
-            )
-            .collect::<Vec<_>>(),
-    )
-}
-
 /// FrameHeaderDescriptor and FrameContentSize
 fn process_frame_header<F: Field>(
     src: &[u8],
@@ -581,29 +513,11 @@ pub fn process<F: Field>(src: &[u8], randomness: Value<F>) -> Vec<ZstdWitnessRow
     let mut witness_rows = vec![];
     let byte_offset = 0;
 
-    // MagicNumber appears at the start of each frame. Here we assert that the compressed data
-    // consists of a single frame.
-    let find_magic_number = |haystack: &[u8], needle: &[u8], from_offset: usize| -> Option<usize> {
-        (from_offset..haystack.len() - needle.len() + 1)
-            .find(|&i| haystack[i..i + needle.len()] == needle[..])
-    };
-    assert_eq!(find_magic_number(src, &MAGIC_NUMBER_BYTES[..], 0), Some(0));
-    assert_eq!(find_magic_number(src, &MAGIC_NUMBER_BYTES[..], 4), None);
-
-    // 1. MagicNumber
-    let (byte_offset, rows) = process_magic_number::<F>(
-        src,
-        byte_offset,
-        &ZstdWitnessRow::init(src.len()),
-        randomness,
-    );
-    witness_rows.extend_from_slice(&rows);
-
-    // 2. FrameHeaderDescriptor and FrameContentSize
+    // FrameHeaderDescriptor and FrameContentSize
     let (byte_offset, rows) = process_frame_header::<F>(
         src,
         byte_offset,
-        rows.last().expect("last row expected to exist"),
+        &ZstdWitnessRow::init(src.len()),
         randomness,
     );
     witness_rows.extend_from_slice(&rows);
@@ -644,6 +558,8 @@ mod tests {
         let compressed = {
             let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0)?;
             encoder.set_pledged_src_size(Some(raw.len() as u64))?;
+            encoder.include_checksum(false)?;
+            encoder.include_magicbytes(false)?;
             encoder.include_contentsize(true)?;
             encoder.write_all(&raw)?;
             encoder.finish()?

@@ -76,11 +76,28 @@ pub struct DecompressionCircuitConfig<F> {
     decoded_byte: Column<Advice>,
     /// The random linear combination of all decoded bytes up to and including the current one.
     decoded_rlc: Column<Advice>,
+    /// Block level details are specified in these columns.
+    block_gadget: BlockGadget<F>,
     /// All zstd tag related columns.
     tag_gadget: ZstdTagGadget<F>,
 
     /// The range table to check value is byte.
     u8_table: U8Table,
+}
+
+/// Block level details are specified in these columns.
+#[derive(Clone, Debug)]
+pub struct BlockGadget<F> {
+    /// The incremental index of the byte within this block.
+    idx: Column<Advice>,
+    /// The number of compressed bytes in the block.
+    block_len: Column<Advice>,
+    /// Helper gadget to compare idx <= block_len.
+    idx_cmp_len: ComparatorConfig<F, 1>,
+    /// Column that holds the type of this block throughout the block rows.
+    block_type: Column<Advice>,
+    /// Boolean column to mark whether or not this is the last block.
+    last_block: Column<Advice>,
 }
 
 /// All tag related columns are placed in this type.
@@ -103,6 +120,8 @@ pub struct ZstdTagGadget<F> {
     tag_idx: Column<Advice>,
     /// The maximum number of bytes that this tag can hold.
     max_len: Column<Advice>,
+    /// A boolean column to indicate that tag has been changed on this row.
+    is_tag_change: Column<Advice>,
     /// Check: tag_idx <= tag_len.
     idx_cmp_len: ComparatorConfig<F, 1>,
     /// Check: tag_len <= max_len.
@@ -131,6 +150,23 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         let decoded_len = meta.advice_column();
         let decoded_byte = meta.advice_column();
         let decoded_rlc = meta.advice_column_in(SecondPhase);
+        let block_gadget = {
+            let idx = meta.advice_column();
+            let block_len = meta.advice_column();
+            BlockGadget {
+                idx,
+                block_len,
+                idx_cmp_len: ComparatorChip::configure(
+                    meta,
+                    |meta| meta.query_fixed(q_enable, Rotation::cur()),
+                    |meta| meta.query_advice(idx, Rotation::cur()),
+                    |meta| meta.query_advice(block_len, Rotation::cur()),
+                    u8_table.into(),
+                ),
+                block_type: meta.advice_column(),
+                last_block: meta.advice_column(),
+            }
+        };
         let tag_gadget = {
             let tag = meta.advice_column();
             let tag_len = meta.advice_column();
@@ -145,6 +181,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 tag_len,
                 tag_idx,
                 max_len,
+                is_tag_change: meta.advice_column(),
                 idx_cmp_len: ComparatorChip::configure(
                     meta,
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
@@ -173,7 +210,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             };
         }
 
-        is_tag!(is_magic_number, MagicNumber);
         is_tag!(is_frame_header_descriptor, FrameHeaderDescriptor);
         is_tag!(is_frame_content_size, FrameContentSize);
         is_tag!(is_block_header, BlockHeader);
@@ -255,6 +291,37 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 ),
             );
 
+            let is_tag_change = meta.query_advice(tag_gadget.is_tag_change, Rotation::cur());
+            cb.require_boolean("is_tag_change is boolean", is_tag_change.expr());
+            cb.condition(is_tag_change, |cb| {
+                cb.require_equal(
+                    "tag_idx == 1",
+                    meta.query_advice(tag_gadget.tag_idx, Rotation::cur()),
+                    1.expr(),
+                );
+                cb.require_equal(
+                    "tag == tag_next::prev",
+                    meta.query_advice(tag_gadget.tag, Rotation::cur()),
+                    meta.query_advice(tag_gadget.tag_next, Rotation::prev()),
+                );
+                cb.require_equal(
+                    "tag_idx::prev == tag_len::prev",
+                    meta.query_advice(tag_gadget.tag_idx, Rotation::prev()),
+                    meta.query_advice(tag_gadget.tag_len, Rotation::prev()),
+                );
+                let (lt, eq) = tag_gadget.len_cmp_max.expr(meta, None);
+                cb.require_equal("tag_len <= max_len", lt + eq, 1.expr());
+            });
+
+            // We also ensure that is_tag_change was in fact assigned True when the tag changed.
+            // The tag changes on the next row iff tag_idx == tag_len.
+            let (_tidx_lt_tlen, tidx_eq_tlen) = tag_gadget.idx_cmp_len.expr(meta, None);
+            cb.require_equal(
+                "is_tag_change' == True",
+                meta.query_advice(tag_gadget.is_tag_change, Rotation::next()),
+                tidx_eq_tlen,
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 not::expr(meta.query_advice(is_padding, Rotation::cur())),
@@ -296,9 +363,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             );
 
             cb.require_equal(
-                "tag == MagicNumber",
+                "tag == FrameHeaderDescriptor",
                 meta.query_advice(tag_gadget.tag, Rotation::cur()),
-                ZstdTag::MagicNumber.expr(),
+                ZstdTag::FrameHeaderDescriptor.expr(),
             );
 
             cb.gate(and::expr([
@@ -329,18 +396,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         debug_assert!(meta.degree() <= 9);
 
         ///////////////////////////////////////////////////////////////////////////////////////////
-        /////////////////////////////////// ZstdTag::MagicNumber //////////////////////////////////
-        ///////////////////////////////////////////////////////////////////////////////////////////
-        meta.create_gate("DecompressionCircuit: MagicNumber", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            cb.gate(and::expr([
-                meta.query_fixed(q_enable, Rotation::cur()),
-                is_magic_number(meta),
-            ]))
-        });
-
-        ///////////////////////////////////////////////////////////////////////////////////////////
         ////////////////////////////// ZstdTag::FrameHeaderDescriptor /////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
         meta.create_gate("DecompressionCircuit: FrameHeaderDescriptor", |meta| {
@@ -351,6 +406,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 is_frame_header_descriptor(meta),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         ///////////////////////////////////////////////////////////////////////////////////////////
         //////////////////////////////// ZstdTag::FrameContentSize ////////////////////////////////
@@ -364,6 +421,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             ]))
         });
 
+        debug_assert!(meta.degree() <= 9);
+
         ///////////////////////////////////////////////////////////////////////////////////////////
         ////////////////////////////////// ZstdTag::BlockHeader ///////////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -375,6 +434,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 is_block_header(meta),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         ///////////////////////////////////////////////////////////////////////////////////////////
         //////////////////////////////////// ZstdTag::RawBlock ////////////////////////////////////
@@ -388,6 +449,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             ]))
         });
 
+        debug_assert!(meta.degree() <= 9);
+
         ///////////////////////////////////////////////////////////////////////////////////////////
         //////////////////////////////////// ZstdTag::RleBlock ////////////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -399,6 +462,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 is_rle_block(meta),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         ///////////////////////////////////////////////////////////////////////////////////////////
         ///////////////////////////// ZstdTag::ZstdBlockLiteralsHeader ////////////////////////////
@@ -412,6 +477,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             ]))
         });
 
+        debug_assert!(meta.degree() <= 9);
+
         ///////////////////////////////////////////////////////////////////////////////////////////
         ///////////////////////////// ZstdTag::ZstdBlockHuffmanHeader /////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -423,6 +490,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 is_zb_huffman_header(meta),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         ///////////////////////////////////////////////////////////////////////////////////////////
         ///////////////////////////////// ZstdTag::ZstdBlockFseCode ///////////////////////////////
@@ -436,6 +505,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             ]))
         });
 
+        debug_assert!(meta.degree() <= 9);
+
         ///////////////////////////////////////////////////////////////////////////////////////////
         /////////////////////////////// ZstdTag::ZstdBlockHuffmanCode /////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -447,6 +518,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 is_zb_huffman_code(meta),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         ///////////////////////////////////////////////////////////////////////////////////////////
         /////////////////////////////// ZstdTag::ZstdBlockJumpTable ///////////////////////////////
@@ -460,6 +533,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             ]))
         });
 
+        debug_assert!(meta.degree() <= 9);
+
         ///////////////////////////////////////////////////////////////////////////////////////////
         //////////////////////////////// ZstdTag::ZstdBlockLstream ////////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -471,6 +546,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 is_zb_lstream(meta),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         Self {
             q_enable,
@@ -484,6 +561,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             decoded_len,
             decoded_byte,
             decoded_rlc,
+            block_gadget,
             tag_gadget,
             u8_table,
         }

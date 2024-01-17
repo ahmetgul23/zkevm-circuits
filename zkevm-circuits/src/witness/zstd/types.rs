@@ -87,8 +87,6 @@ impl From<u8> for BlockType {
 pub enum ZstdTag {
     /// Null should not occur.
     Null = 0,
-    /// Magic number bytes.
-    MagicNumber,
     /// The frame header's descriptor.
     FrameHeaderDescriptor,
     /// The frame's content size.
@@ -125,7 +123,6 @@ impl ToString for ZstdTag {
     fn to_string(&self) -> String {
         String::from(match self {
             Self::Null => "null",
-            Self::MagicNumber => "MagicNumber",
             Self::FrameHeaderDescriptor => "FrameHeaderDescriptor",
             Self::FrameContentSize => "FrameContentSize",
             Self::BlockHeader => "BlockHeader",
@@ -155,7 +152,7 @@ impl<F: Field> Default for ZstdState<F> {
     fn default() -> Self {
         Self {
             tag: ZstdTag::Null,
-            tag_next: ZstdTag::MagicNumber,
+            tag_next: ZstdTag::FrameHeaderDescriptor,
             tag_len: 0,
             tag_idx: 0,
             tag_value: Value::known(F::zero()),
