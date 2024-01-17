@@ -401,6 +401,67 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta.create_gate("DecompressionCircuit: FrameHeaderDescriptor", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            // FrameHeaderDescriptor is a single byte.
+            cb.require_equal(
+                "tag_idx == 1",
+                meta.query_advice(tag_gadget.tag_idx, Rotation::cur()),
+                1.expr(),
+            );
+            cb.require_equal(
+                "tag_len == 1",
+                meta.query_advice(tag_gadget.tag_len, Rotation::cur()),
+                1.expr(),
+            );
+
+            // Structure of the Frame's header descriptor.
+            //
+            // | Bit number | Field Name              | Expected Value |
+            // |------------|-------------------------|----------------|
+            // | 7-6        | Frame_Content_Size_Flag | ?              |
+            // | 5          | Single_Segment_Flag     | 1              |
+            // | 4          | Unused_Bit              | 0              |
+            // | 3          | Reserved_Bit            | 0              |
+            // | 2          | Content_Checksum_Flag   | 0              |
+            // | 1-0        | Dictionary_ID_Flag      | 0              |
+            cb.require_zero(
+                "FHD: Unused_Bit",
+                meta.query_advice(value_bits[4], Rotation::cur()),
+            );
+            cb.require_zero(
+                "FHD: Reserved_Bit",
+                meta.query_advice(value_bits[3], Rotation::cur()),
+            );
+            cb.require_zero(
+                "FHD: Content_Checksum_Flag",
+                meta.query_advice(value_bits[2], Rotation::cur()),
+            );
+            cb.require_zero(
+                "FHD: Dictionary_ID_Flag",
+                meta.query_advice(value_bits[1], Rotation::cur()),
+            );
+            cb.require_zero(
+                "FHD: Dictionary_ID_Flag",
+                meta.query_advice(value_bits[0], Rotation::cur()),
+            );
+
+            // Checks for the next tag, i.e. FrameContentSize.
+            let fcs_flag0 = meta.query_advice(value_bits[7], Rotation::cur());
+            let fcs_flag1 = meta.query_advice(value_bits[6], Rotation::cur());
+            let fcs_field_size = select::expr(
+                fcs_flag0.expr() * fcs_flag1.expr(),
+                8.expr(),
+                select::expr(
+                    not::expr(fcs_flag0.expr() + fcs_flag1.expr()),
+                    1.expr(),
+                    select::expr(fcs_flag0, 4.expr(), 2.expr()),
+                ),
+            );
+            cb.require_equal(
+                "tag_len' == fcs_field_size",
+                meta.query_advice(tag_gadget.tag_len, Rotation::next()),
+                fcs_field_size,
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_frame_header_descriptor(meta),
@@ -414,6 +475,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         meta.create_gate("DecompressionCircuit: FrameContentSize", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_zero("dummy", 0.expr());
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
@@ -429,6 +492,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta.create_gate("DecompressionCircuit: BlockHeader", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            cb.require_zero("dummy", 0.expr());
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_block_header(meta),
@@ -442,6 +507,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         meta.create_gate("DecompressionCircuit: RawBlock", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_zero("dummy", 0.expr());
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
@@ -457,6 +524,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta.create_gate("DecompressionCircuit: RleBlock", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            cb.require_zero("dummy", 0.expr());
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_rle_block(meta),
@@ -470,6 +539,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         meta.create_gate("DecompressionCircuit: ZstdBlockLiteralsHeader", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_zero("dummy", 0.expr());
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
@@ -485,6 +556,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta.create_gate("DecompressionCircuit: ZstdBlockHuffmanHeader", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            cb.require_zero("dummy", 0.expr());
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_zb_huffman_header(meta),
@@ -498,6 +571,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         meta.create_gate("DecompressionCircuit: ZstdBlockFseCode", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_zero("dummy", 0.expr());
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
@@ -513,6 +588,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta.create_gate("DecompressionCircuit: ZstdBlockHuffmanCode", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            cb.require_zero("dummy", 0.expr());
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_zb_huffman_code(meta),
@@ -527,6 +604,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta.create_gate("DecompressionCircuit: ZstdBlockJumpTable", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
+            cb.require_zero("dummy", 0.expr());
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_zb_jump_table(meta),
@@ -540,6 +619,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         meta.create_gate("DecompressionCircuit: ZstdBlockLstream", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_zero("dummy", 0.expr());
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
