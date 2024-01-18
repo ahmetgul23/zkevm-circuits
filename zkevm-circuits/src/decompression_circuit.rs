@@ -13,6 +13,7 @@ use eth_types::Field;
 use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
     comparator::{ComparatorChip, ComparatorConfig},
+    less_than::{LtChip, LtConfig},
     util::{and, not, select, Expr},
 };
 use halo2_proofs::{
@@ -124,6 +125,8 @@ pub struct ZstdTagGadget<F> {
     tag_idx: Column<Advice>,
     /// The maximum number of bytes that this tag can hold.
     max_len: Column<Advice>,
+    /// Helper gadget to check whether max_len < 0x20.
+    mlen_lt_0x20: LtConfig<F, 1>,
     /// A boolean column to indicate that tag has been changed on this row.
     is_tag_change: Column<Advice>,
     /// Check: tag_idx <= tag_len.
@@ -208,6 +211,13 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 tag_len,
                 tag_idx,
                 max_len,
+                mlen_lt_0x20: LtChip::configure(
+                    meta,
+                    |meta| meta.query_fixed(q_enable, Rotation::cur()),
+                    |meta| meta.query_advice(max_len, Rotation::cur()),
+                    |_meta| 0x20.expr(),
+                    u8_table.into(),
+                ),
                 is_tag_change: meta.advice_column(),
                 idx_cmp_len: ComparatorChip::configure(
                     meta,
@@ -368,6 +378,11 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     1.expr(),
                 );
                 cb.require_equal(
+                    "tag_value_acc == byte value",
+                    meta.query_advice(tag_gadget.tag_value_acc, Rotation::cur()),
+                    meta.query_advice(value_byte, Rotation::cur()),
+                );
+                cb.require_equal(
                     "tag == tag_next::prev",
                     meta.query_advice(tag_gadget.tag, Rotation::cur()),
                     meta.query_advice(tag_gadget.tag_next, Rotation::prev()),
@@ -377,18 +392,53 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(tag_gadget.tag_idx, Rotation::prev()),
                     meta.query_advice(tag_gadget.tag_len, Rotation::prev()),
                 );
+                cb.require_equal(
+                    "tag_value::prev == tag_value_acc::prev",
+                    meta.query_advice(tag_gadget.tag_value, Rotation::prev()),
+                    meta.query_advice(tag_gadget.tag_value_acc, Rotation::prev()),
+                );
                 let (lt, eq) = tag_gadget.len_cmp_max.expr(meta, None);
                 cb.require_equal("tag_len <= max_len", lt + eq, 1.expr());
             });
 
             // We also ensure that is_tag_change was in fact assigned True when the tag changed.
             // The tag changes on the next row iff tag_idx == tag_len.
-            let (_tidx_lt_tlen, tidx_eq_tlen) = tag_gadget.idx_cmp_len.expr(meta, None);
+            //
+            // And validate tag_value_acc calculation.
+            let (tidx_lt_tlen, tidx_eq_tlen) = tag_gadget.idx_cmp_len.expr(meta, None);
             cb.require_equal(
                 "is_tag_change' == True",
                 meta.query_advice(tag_gadget.is_tag_change, Rotation::next()),
                 tidx_eq_tlen,
             );
+            cb.condition(tidx_lt_tlen, |cb| {
+                // tag_value_acc changes only when byte_idx increments.
+                let tag_value_acc_curr =
+                    meta.query_advice(tag_gadget.tag_value_acc, Rotation::cur());
+                let tag_value_acc_next =
+                    meta.query_advice(tag_gadget.tag_value_acc, Rotation::next());
+                let byte_idx_curr = meta.query_advice(byte_idx, Rotation::cur());
+                let byte_idx_next = meta.query_advice(byte_idx, Rotation::next());
+                let is_new_byte = byte_idx_next - byte_idx_curr;
+
+                // tag_value_acc is accumulated using either 256 or keccak_randomness, depending on
+                // the max_len of this tag.
+                let multiplier = select::expr(
+                    tag_gadget.mlen_lt_0x20.is_lt(meta, None),
+                    256.expr(),
+                    challenges.keccak_input(),
+                );
+                cb.require_equal(
+                    "tag_value_acc' check",
+                    tag_value_acc_next,
+                    select::expr(
+                        is_new_byte,
+                        tag_value_acc_curr.expr() * multiplier
+                            + meta.query_advice(value_byte, Rotation::next()),
+                        tag_value_acc_curr,
+                    ),
+                );
+            });
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
@@ -522,6 +572,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 ]))
             },
         );
+
+        debug_assert!(meta.degree() <= 9);
+
         meta.create_gate("DecompressionCircuit: reverse chunk boundary end", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
@@ -556,6 +609,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 not::expr(meta.query_advice(reverse_chunk.is_reverse, Rotation::next())),
             ]))
         });
+
+        debug_assert!(meta.degree() <= 9);
+
         meta.lookup_any(
             "DecompressionCircuit: rand ^ (r_len + 1) check at boundary end",
             |meta| {
@@ -576,6 +632,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 .collect::<Vec<_>>()
             },
         );
+
+        debug_assert!(meta.degree() <= 9);
+
         meta.create_gate("DecompressionCircuit: reverse chunk", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
