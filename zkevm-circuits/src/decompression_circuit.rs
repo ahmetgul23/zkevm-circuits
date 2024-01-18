@@ -25,7 +25,7 @@ use halo2_proofs::{
 
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
-    table::{KeccakTable, U8Table},
+    table::{decompression::ZstdRomTable, KeccakTable, LookupTable, U8Table},
     util::{Challenges, SubCircuit, SubCircuitConfig},
     witness::{Block, ZstdTag, N_BITS_PER_BYTE, N_BITS_ZSTD_TAG},
 };
@@ -139,6 +139,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             keccak_table: _,
         }: Self::ConfigArgs,
     ) -> Self {
+        // Create the fixed columns read-only memory table for zstd (tag, tag_next, max_len).
+        let rom_table = ZstdRomTable::construct(meta);
+
         let q_enable = meta.fixed_column();
         let q_first = meta.fixed_column();
         let is_padding = meta.advice_column();
@@ -395,6 +398,26 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
 
         debug_assert!(meta.degree() <= 9);
 
+        meta.lookup_any("ROM table lookup", |meta| {
+            let cond = and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                meta.query_fixed(q_enable, Rotation::next()),
+                not::expr(meta.query_advice(is_padding, Rotation::cur())),
+                not::expr(meta.query_advice(is_padding, Rotation::next())),
+            ]);
+            vec![
+                meta.query_advice(tag_gadget.tag, Rotation::cur()),
+                meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
+                meta.query_advice(tag_gadget.max_len, Rotation::cur()),
+            ]
+            .into_iter()
+            .zip(rom_table.table_exprs(meta))
+            .map(|(arg, table)| (cond.expr() * arg, table))
+            .collect()
+        });
+
+        debug_assert!(meta.degree() <= 9);
+
         ///////////////////////////////////////////////////////////////////////////////////////////
         ////////////////////////////// ZstdTag::FrameHeaderDescriptor /////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
@@ -423,6 +446,11 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             // | 3          | Reserved_Bit            | 0              |
             // | 2          | Content_Checksum_Flag   | 0              |
             // | 1-0        | Dictionary_ID_Flag      | 0              |
+            cb.require_equal(
+                "FHD: Single_Segment_Flag",
+                meta.query_advice(value_bits[5], Rotation::cur()),
+                1.expr(),
+            );
             cb.require_zero(
                 "FHD: Unused_Bit",
                 meta.query_advice(value_bits[4], Rotation::cur()),
