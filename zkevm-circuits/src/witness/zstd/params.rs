@@ -1,6 +1,7 @@
 /// Number of bits to represent a byte.
 pub const N_BITS_PER_BYTE: usize = 8;
 
+/// Number of bytes used to specify block header.
 pub const N_BLOCK_HEADER_BYTES: usize = 3;
 
 /// Maximum number of symbols (weights), i.e. symbol in [0, N_MAX_SYMBOLS).
