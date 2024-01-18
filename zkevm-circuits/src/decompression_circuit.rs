@@ -25,7 +25,7 @@ use halo2_proofs::{
 
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
-    table::{decompression::ZstdRomTable, KeccakTable, LookupTable, U8Table},
+    table::{decompression::ZstdRomTable, KeccakTable, LookupTable, Pow2Table, U8Table},
     util::{Challenges, SubCircuit, SubCircuitConfig},
     witness::{Block, ZstdTag, N_BITS_PER_BYTE, N_BITS_ZSTD_TAG},
 };
@@ -36,6 +36,8 @@ pub struct DecompressionCircuitConfigArgs<F> {
     pub challenges: Challenges<Expression<F>>,
     /// U8 table, i.e. RangeTable for 0..8.
     pub u8_table: U8Table,
+    /// Power of 2 table.
+    pub pow2_table: Pow2Table,
     /// Table from the Keccak circuit.
     pub keccak_table: KeccakTable,
 }
@@ -80,6 +82,8 @@ pub struct DecompressionCircuitConfig<F> {
     block_gadget: BlockGadget<F>,
     /// All zstd tag related columns.
     tag_gadget: ZstdTagGadget<F>,
+    /// Columns used to process bytes back-to-front.
+    reverse_chunk: ReverseChunk,
 
     /// The range table to check value is byte.
     u8_table: U8Table,
@@ -128,6 +132,25 @@ pub struct ZstdTagGadget<F> {
     len_cmp_max: ComparatorConfig<F, 1>,
 }
 
+/// Columns related to processing little-endian chunk of bytes.
+#[derive(Clone, Debug)]
+pub struct ReverseChunk {
+    /// Boolean indicator whether we are processing a chunk of bytes in back-to-front order, i.e.
+    /// little endian representation.
+    is_reverse: Column<Advice>,
+    /// The number of bytes in this reverse chunk.
+    r_len: Column<Advice>,
+    /// The reverse index within this chunk, that starts at r_len and decrements to 1 on the final
+    /// byte of the chunk.
+    r_idx: Column<Advice>,
+    /// Stores the value_rlc that was seen just before the start of the reverse chunk.
+    value_rlc_before: Column<Advice>,
+    /// Stores the value_rlc for bytes in this chunk.
+    value_rlc_chunk: Column<Advice>,
+    /// Stores the value for randomness ^ (r_len + 1).
+    rand_pow: Column<Advice>,
+}
+
 impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
     type ConfigArgs = DecompressionCircuitConfigArgs<F>;
 
@@ -136,6 +159,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         Self::ConfigArgs {
             challenges,
             u8_table,
+            pow2_table,
             keccak_table: _,
         }: Self::ConfigArgs,
     ) -> Self {
@@ -179,8 +203,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 tag,
                 tag_bits: BinaryNumberChip::configure(meta, q_enable, Some(tag.into())),
                 tag_next: meta.advice_column(),
-                tag_value: meta.advice_column(),
-                tag_value_acc: meta.advice_column(),
+                tag_value: meta.advice_column_in(SecondPhase),
+                tag_value_acc: meta.advice_column_in(SecondPhase),
                 tag_len,
                 tag_idx,
                 max_len,
@@ -200,6 +224,14 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     u8_table.into(),
                 ),
             }
+        };
+        let reverse_chunk = ReverseChunk {
+            is_reverse: meta.advice_column(),
+            r_len: meta.advice_column(),
+            r_idx: meta.advice_column(),
+            value_rlc_before: meta.advice_column_in(SecondPhase),
+            value_rlc_chunk: meta.advice_column_in(SecondPhase),
+            rand_pow: meta.advice_column(),
         };
 
         macro_rules! is_tag {
@@ -225,6 +257,40 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         is_tag!(is_zb_jump_table, ZstdBlockJumpTable);
         is_tag!(is_zb_lstream, Lstream);
 
+        let constrain_value_rlc =
+            |meta: &mut VirtualCells<F>, cb: &mut BaseConstraintBuilder<F>, is_reverse: bool| {
+                let byte_idx_curr = meta.query_advice(byte_idx, Rotation::cur());
+                let byte_idx_next = meta.query_advice(byte_idx, Rotation::next());
+                let is_new_byte = byte_idx_next - byte_idx_curr;
+
+                let value_rlc_curr = meta.query_advice(value_rlc, Rotation::cur());
+                let value_rlc_next = meta.query_advice(value_rlc, Rotation::next());
+
+                if is_reverse {
+                    let value_byte_curr = meta.query_advice(value_byte, Rotation::cur());
+                    cb.require_equal(
+                        "value_rlc' in reverse chunk",
+                        value_rlc_curr,
+                        select::expr(
+                            is_new_byte.expr(),
+                            value_rlc_next.expr() * challenges.keccak_input() + value_byte_curr,
+                            value_rlc_next,
+                        ),
+                    );
+                } else {
+                    let value_byte_next = meta.query_advice(value_byte, Rotation::next());
+                    cb.require_equal(
+                        "value_rlc' in normal chunk",
+                        value_rlc_next,
+                        select::expr(
+                            is_new_byte,
+                            value_rlc_curr.expr() * challenges.keccak_input() + value_byte_next,
+                            value_rlc_curr,
+                        ),
+                    );
+                }
+            };
+
         meta.create_gate("DecompressionCircuit: all rows", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
@@ -237,6 +303,11 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 "is_padding transitions from 0 -> 1 only once",
                 meta.query_advice(is_padding, Rotation::next())
                     - meta.query_advice(is_padding, Rotation::cur()),
+            );
+
+            cb.require_boolean(
+                "reverse is boolean",
+                meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
             );
 
             cb.gate(meta.query_fixed(q_enable, Rotation::cur()))
@@ -278,20 +349,14 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 meta.query_advice(encoded_len, Rotation::next()),
             );
 
-            let byte_idx_next = meta.query_advice(byte_idx, Rotation::next());
-            let byte_idx_curr = meta.query_advice(byte_idx, Rotation::cur());
-            let is_new_byte = byte_idx_next - byte_idx_curr;
-            let value_rlc_next = meta.query_advice(value_rlc, Rotation::next());
-            let value_rlc_curr = meta.query_advice(value_rlc, Rotation::cur());
-            let value_byte_next = meta.query_advice(value_byte, Rotation::next());
-            cb.require_equal(
-                "value_rlc' computation",
-                value_rlc_next,
-                select::expr(
-                    is_new_byte,
-                    value_rlc_curr.expr() * challenges.keccak_input() + value_byte_next,
-                    value_rlc_curr,
-                ),
+            cb.condition(
+                and::expr([
+                    not::expr(meta.query_advice(reverse_chunk.is_reverse, Rotation::cur())),
+                    not::expr(meta.query_advice(reverse_chunk.is_reverse, Rotation::next())),
+                ]),
+                |cb| {
+                    constrain_value_rlc(meta, cb, false);
+                },
             );
 
             let is_tag_change = meta.query_advice(tag_gadget.is_tag_change, Rotation::cur());
@@ -371,6 +436,11 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 ZstdTag::FrameHeaderDescriptor.expr(),
             );
 
+            cb.require_zero(
+                "is_reverse == 0 on first compressed byte",
+                meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 meta.query_fixed(q_first, Rotation::cur()),
@@ -414,6 +484,128 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             .zip(rom_table.table_exprs(meta))
             .map(|(arg, table)| (cond.expr() * arg, table))
             .collect()
+        });
+
+        debug_assert!(meta.degree() <= 9);
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        //////////////////////////// Processing bytes back-to-front ///////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate(
+            "DecompressionCircuit: reverse chunk boundary begin",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
+
+                cb.require_equal(
+                    "value_rlc' == value_rlc_chunk'",
+                    meta.query_advice(value_rlc, Rotation::next()),
+                    meta.query_advice(reverse_chunk.value_rlc_chunk, Rotation::next()),
+                );
+
+                cb.require_equal(
+                    "value_rlc_before' == value_rlc",
+                    meta.query_advice(reverse_chunk.value_rlc_before, Rotation::next()),
+                    meta.query_advice(value_rlc, Rotation::cur()),
+                );
+
+                cb.require_equal(
+                    "r_idx' == r_len'",
+                    meta.query_advice(reverse_chunk.r_idx, Rotation::next()),
+                    meta.query_advice(reverse_chunk.r_len, Rotation::next()),
+                );
+
+                cb.gate(and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    not::expr(meta.query_advice(is_padding, Rotation::next())),
+                    not::expr(meta.query_advice(reverse_chunk.is_reverse, Rotation::cur())),
+                    meta.query_advice(reverse_chunk.is_reverse, Rotation::next()),
+                ]))
+            },
+        );
+        meta.create_gate("DecompressionCircuit: reverse chunk boundary end", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_equal(
+                "r_idx == 1",
+                meta.query_advice(reverse_chunk.r_idx, Rotation::cur()),
+                1.expr(),
+            );
+
+            cb.require_equal(
+                "value_rlc == value_byte",
+                meta.query_advice(value_rlc, Rotation::cur()),
+                meta.query_advice(value_byte, Rotation::cur()),
+            );
+
+            let rlc_before_chunk =
+                meta.query_advice(reverse_chunk.value_rlc_before, Rotation::cur());
+            let rand_pow = meta.query_advice(reverse_chunk.rand_pow, Rotation::cur());
+            let rlc_chunk = meta.query_advice(reverse_chunk.value_rlc_chunk, Rotation::cur());
+            cb.require_equal(
+                "value_rlc' at reverse boundary end",
+                meta.query_advice(value_rlc, Rotation::next()),
+                rlc_before_chunk * rand_pow
+                    + rlc_chunk * challenges.keccak_input()
+                    + meta.query_advice(value_byte, Rotation::next()),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                not::expr(meta.query_advice(is_padding, Rotation::next())),
+                meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
+                not::expr(meta.query_advice(reverse_chunk.is_reverse, Rotation::next())),
+            ]))
+        });
+        meta.lookup_any(
+            "DecompressionCircuit: rand ^ (r_len + 1) check at boundary end",
+            |meta| {
+                let condition = and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    not::expr(meta.query_advice(is_padding, Rotation::next())),
+                    meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
+                    not::expr(meta.query_advice(reverse_chunk.is_reverse, Rotation::next())),
+                ]);
+
+                [
+                    meta.query_advice(reverse_chunk.r_len, Rotation::cur()) + 1.expr(),
+                    meta.query_advice(reverse_chunk.rand_pow, Rotation::cur()),
+                ]
+                .into_iter()
+                .zip(pow2_table.table_exprs(meta))
+                .map(|(input, table)| (input * condition.clone(), table))
+                .collect::<Vec<_>>()
+            },
+        );
+        meta.create_gate("DecompressionCircuit: reverse chunk", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_equal(
+                "value_rlc_before unchanged",
+                meta.query_advice(reverse_chunk.value_rlc_before, Rotation::cur()),
+                meta.query_advice(reverse_chunk.value_rlc_before, Rotation::next()),
+            );
+
+            cb.require_equal(
+                "value_rlc_chunk unchanged",
+                meta.query_advice(reverse_chunk.value_rlc_chunk, Rotation::cur()),
+                meta.query_advice(reverse_chunk.value_rlc_chunk, Rotation::next()),
+            );
+
+            cb.require_equal(
+                "r_len unchanged",
+                meta.query_advice(reverse_chunk.r_len, Rotation::cur()),
+                meta.query_advice(reverse_chunk.r_len, Rotation::next()),
+            );
+
+            // value_rlc updates only if byte_idx' == byte_idx + 1.
+            constrain_value_rlc(meta, &mut cb, true /* reverse */);
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                not::expr(meta.query_advice(is_padding, Rotation::next())),
+                meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
+                meta.query_advice(reverse_chunk.is_reverse, Rotation::next()),
+            ]))
         });
 
         debug_assert!(meta.degree() <= 9);
@@ -672,6 +864,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             decoded_rlc,
             block_gadget,
             tag_gadget,
+            reverse_chunk,
             u8_table,
         }
     }
