@@ -70,9 +70,11 @@ pub struct DecompressionCircuitConfig<F> {
     value_bits: [Column<Advice>; N_BITS_PER_BYTE],
     /// The random linear combination of all encoded bytes up to and including the current one.
     value_rlc: Column<Advice>,
+    /// Holds the number of bytes in the decoded data.
+    decoded_len: Column<Advice>,
     /// An accumulator for the number of decoded bytes. For every byte decoded, we expect the
     /// accumulator to be incremented.
-    decoded_len: Column<Advice>,
+    decoded_len_acc: Column<Advice>,
     /// The byte value that is decoded at the current row. We don't decode a byte at every row. And
     /// we might end up decoding more than one bytes while the byte_idx remains the same, for
     /// instance, while processing bits and decoding the Huffman Codes.
@@ -178,6 +180,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         let value_bits = array_init(|_| meta.advice_column());
         let value_rlc = meta.advice_column_in(SecondPhase);
         let decoded_len = meta.advice_column();
+        let decoded_len_acc = meta.advice_column();
         let decoded_byte = meta.advice_column();
         let decoded_rlc = meta.advice_column_in(SecondPhase);
         let block_gadget = {
@@ -357,6 +360,12 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 "encoded length remains the same",
                 meta.query_advice(encoded_len, Rotation::cur()),
                 meta.query_advice(encoded_len, Rotation::next()),
+            );
+
+            cb.require_equal(
+                "decoded length remains the same",
+                meta.query_advice(decoded_len, Rotation::cur()),
+                meta.query_advice(decoded_len, Rotation::next()),
             );
 
             cb.condition(
@@ -752,13 +761,29 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         //////////////////////////////// ZstdTag::FrameContentSize ////////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
+
+        // Note: We only verify the 1st row of FrameContentSize for tag_value.
         meta.create_gate("DecompressionCircuit: FrameContentSize", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
-            cb.require_zero("dummy", 0.expr());
+            // The previous row is FrameHeaderDescriptor.
+            let fcs_flag0 = meta.query_advice(value_bits[7], Rotation::prev());
+            let fcs_flag1 = meta.query_advice(value_bits[6], Rotation::prev());
+            let fcs_tag_value = meta.query_advice(tag_gadget.tag_value, Rotation::cur());
+            let frame_content_size = select::expr(
+                and::expr([fcs_flag0, not::expr(fcs_flag1)]),
+                256.expr() + fcs_tag_value.expr(),
+                fcs_tag_value,
+            );
+            cb.require_equal(
+                "decoded_len == frame_content_size",
+                frame_content_size,
+                meta.query_advice(decoded_len, Rotation::cur()),
+            );
 
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
+                meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
                 is_frame_content_size(meta),
             ]))
         });
@@ -919,6 +944,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             value_bits,
             value_rlc,
             decoded_len,
+            decoded_len_acc,
             decoded_byte,
             decoded_rlc,
             block_gadget,
