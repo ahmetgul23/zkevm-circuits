@@ -14,7 +14,7 @@ use gadgets::{
     binary_number::{BinaryNumberChip, BinaryNumberConfig},
     comparator::{ComparatorChip, ComparatorConfig},
     less_than::{LtChip, LtConfig},
-    util::{and, not, select, Expr},
+    util::{and, not, select, sum, Expr},
 };
 use halo2_proofs::{
     circuit::{Layouter, Value},
@@ -269,7 +269,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
 
         macro_rules! is_tag {
             ($var:ident, $tag_variant:ident) => {
-                #[allow(unused_variables)]
                 let $var = |meta: &mut VirtualCells<F>| {
                     tag_gadget
                         .tag_bits
@@ -278,6 +277,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             };
         }
 
+        is_tag!(is_null, Null);
         is_tag!(is_frame_header_descriptor, FrameHeaderDescriptor);
         is_tag!(is_frame_content_size, FrameContentSize);
         is_tag!(is_block_header, BlockHeader);
@@ -523,6 +523,15 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             cb.require_zero(
                 "is_reverse == 0 on first compressed byte",
                 meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
+            );
+
+            cb.require_zero(
+                "decoded_rlc initialises at 0",
+                meta.query_advice(decoded_rlc, Rotation::cur()),
+            );
+            cb.require_zero(
+                "decoded_len_acc initialises at 0",
+                meta.query_advice(decoded_len_acc, Rotation::cur()),
             );
 
             cb.gate(and::expr([
@@ -846,13 +855,49 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             let block_type_bit1 = meta.query_advice(value_bits[5], Rotation::cur());
             cb.require_zero(
                 "block type cannot be RESERVED, i.e. block_type == 3 not possible",
-                block_type_bit0 * block_type_bit1,
+                block_type_bit0.expr() * block_type_bit1.expr(),
             );
             cb.require_equal(
                 "block_idx == 1",
                 meta.query_advice(block_gadget.idx, Rotation(N_BLOCK_HEADER_BYTES as i32)),
                 1.expr(),
             );
+
+            // For Raw/RLE blocks, the block_len is equal to the tag_len. These blocks appear with
+            // block type 00 or 01, i.e. the block_type_bit1 is 0.
+            cb.condition(not::expr(block_type_bit1), |cb| {
+                cb.require_equal(
+                    "Raw/RLE blocks: tag_len == block_len",
+                    meta.query_advice(tag_gadget.tag_len, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                    meta.query_advice(
+                        block_gadget.block_len,
+                        Rotation(N_BLOCK_HEADER_BYTES as i32),
+                    ),
+                );
+            });
+
+            // Validate that for an RLE block:
+            // - decoded_rlc calculation on the first row.
+            // - decoded_len_acc increment on the first row.
+            // - value_byte == decoded_byte.
+            cb.condition(block_type_bit0, |cb| {
+                cb.require_equal(
+                    "decoded_rlc calculation for RLE block's first row",
+                    meta.query_advice(decoded_rlc, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                    meta.query_advice(decoded_rlc, Rotation::cur()) * challenges.keccak_input()
+                        + meta.query_advice(decoded_byte, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                );
+                cb.require_equal(
+                    "decoded_len_acc increments",
+                    meta.query_advice(decoded_len_acc, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                    meta.query_advice(decoded_len_acc, Rotation::cur()) + 1.expr(),
+                );
+                cb.require_equal(
+                    "for RLE block, value_byte == decoded_byte",
+                    meta.query_advice(value_byte, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                    meta.query_advice(decoded_byte, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                );
+            });
 
             // If this wasn't the first block, then the previous block's last byte should have
             // block's idx == block length.
@@ -909,6 +954,44 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 meta.query_advice(block_gadget.is_block, Rotation::next()),
             ]))
         });
+        meta.create_gate("DecompressionCircuit: handle last block", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            let is_last_block = meta.query_advice(block_gadget.is_last_block, Rotation::cur());
+            cb.require_equal(
+                "tag_next depending on whether or not this is the last block",
+                meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
+                select::expr(
+                    is_last_block.expr(),
+                    ZstdTag::Null.expr(),
+                    ZstdTag::BlockHeader.expr(),
+                ),
+            );
+            cb.condition(is_last_block, |cb| {
+                cb.require_equal(
+                    "decoded_len has been reached if last block",
+                    meta.query_advice(decoded_len_acc, Rotation::cur()),
+                    meta.query_advice(decoded_len, Rotation::cur()),
+                );
+                cb.require_equal(
+                    "byte idx has reached the encoded len",
+                    meta.query_advice(byte_idx, Rotation::cur()),
+                    meta.query_advice(encoded_len, Rotation::cur()),
+                );
+            });
+
+            let (_lt, tidx_eq_tlen) = tag_gadget.idx_cmp_len.expr(meta, None);
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                not::expr(meta.query_advice(is_padding, Rotation::cur())),
+                tidx_eq_tlen,
+                sum::expr([
+                    is_raw_block(meta),
+                    is_rle_block(meta),
+                    // TODO: block can end after ZstdSequence also
+                ]),
+            ]))
+        });
         meta.lookup(
             "DecompressionCircuit: BlockHeader (BlockSize == BlockHeader >> 3)",
             |meta| {
@@ -958,6 +1041,29 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 1.expr(),
             );
 
+            // Every row represents an uncompressed byte that is decoded as-is.
+            cb.require_equal(
+                "decoded_len_acc increments",
+                meta.query_advice(decoded_len_acc, Rotation::cur()),
+                meta.query_advice(decoded_len_acc, Rotation::prev()) + 1.expr(),
+            );
+
+            // TODO: change this. We can have an is_output boolean column which is constrained to
+            // be true for tags that output decoded bytes. Decoded RLC calculation can then be
+            // limited to a single gate where is_output == true.
+            cb.require_equal(
+                "decoded_rlc calculation",
+                meta.query_advice(decoded_rlc, Rotation::cur()),
+                meta.query_advice(decoded_rlc, Rotation::prev()) * challenges.keccak_input()
+                    + meta.query_advice(decoded_byte, Rotation::cur()),
+            );
+
+            cb.require_equal(
+                "value byte == decoded byte",
+                meta.query_advice(value_byte, Rotation::cur()),
+                meta.query_advice(decoded_byte, Rotation::cur()),
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_raw_block(meta),
@@ -969,6 +1075,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         //////////////////////////////////// ZstdTag::RleBlock ////////////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
+
+        // Note: We do not constrain the first row of RLE block, as it is handled from the
+        // BlockHeader tag.
         meta.create_gate("DecompressionCircuit: RleBlock", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
@@ -978,9 +1087,45 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 1.expr(),
             );
 
+            cb.require_equal(
+                "value byte == decoded byte",
+                meta.query_advice(value_byte, Rotation::cur()),
+                meta.query_advice(decoded_byte, Rotation::cur()),
+            );
+
+            cb.require_equal(
+                "decoded byte remains the same",
+                meta.query_advice(decoded_byte, Rotation::cur()),
+                meta.query_advice(decoded_byte, Rotation::prev()),
+            );
+
+            cb.require_equal(
+                "byte idx remains the same",
+                meta.query_advice(byte_idx, Rotation::cur()),
+                meta.query_advice(byte_idx, Rotation::prev()),
+            );
+
+            // Every row represents an uncompressed byte.
+            cb.require_equal(
+                "decoded_len_acc increments",
+                meta.query_advice(decoded_len_acc, Rotation::cur()),
+                meta.query_advice(decoded_len_acc, Rotation::prev()) + 1.expr(),
+            );
+
+            // TODO: change this. We can have an is_output boolean column which is constrained to
+            // be true for tags that output decoded bytes. Decoded RLC calculation can then be
+            // limited to a single gate where is_output == true.
+            cb.require_equal(
+                "decoded_rlc calculation",
+                meta.query_advice(decoded_rlc, Rotation::cur()),
+                meta.query_advice(decoded_rlc, Rotation::prev()) * challenges.keccak_input()
+                    + meta.query_advice(decoded_byte, Rotation::cur()),
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_rle_block(meta),
+                not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
             ]))
         });
 
