@@ -89,7 +89,7 @@ pub struct DecompressionCircuitConfig<F> {
     /// Block level details are specified in these columns.
     block_gadget: BlockGadget,
     /// All zstd tag related columns.
-    tag_gadget: ZstdTagGadget<F>,
+    tag_gadget: TagGadget<F>,
     /// Columns used to process bytes back-to-front.
     reverse_chunk: ReverseChunk,
 
@@ -112,7 +112,7 @@ pub struct BlockGadget {
 
 /// All tag related columns are placed in this type.
 #[derive(Clone, Debug)]
-pub struct ZstdTagGadget<F> {
+pub struct TagGadget<F> {
     /// The zstd tag at the current row.
     tag: Column<Advice>,
     /// Helper gadget to construct equality constraints against the current tag.
@@ -130,6 +130,8 @@ pub struct ZstdTagGadget<F> {
     tag_idx: Column<Advice>,
     /// The maximum number of bytes that this tag can hold.
     max_len: Column<Advice>,
+    /// Whether this tag outputs a decoded byte or not.
+    is_output: Column<Advice>,
     /// Helper gadget to check whether max_len < 0x20.
     mlen_lt_0x20: LtConfig<F, 1>,
     /// A boolean column to indicate that tag has been changed on this row.
@@ -225,7 +227,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             let tag_len = meta.advice_column();
             let tag_idx = meta.advice_column();
             let max_len = meta.advice_column();
-            ZstdTagGadget {
+            TagGadget {
                 tag,
                 tag_bits: BinaryNumberChip::configure(meta, q_enable, Some(tag.into())),
                 tag_next: meta.advice_column(),
@@ -234,6 +236,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 tag_len,
                 tag_idx,
                 max_len,
+                is_output: meta.advice_column(),
                 mlen_lt_0x20: LtChip::configure(
                     meta,
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
@@ -482,6 +485,34 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
 
         debug_assert!(meta.degree() <= 9);
 
+        meta.create_gate(
+            "DecompressionCircuit: decoded byte when tag is output",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
+
+                cb.require_equal(
+                    "decoded length accumulator increments",
+                    meta.query_advice(decoded_len_acc, Rotation::cur()),
+                    meta.query_advice(decoded_len_acc, Rotation::prev()) + 1.expr(),
+                );
+
+                cb.require_equal(
+                    "decoded bytes RLC calculated correctly",
+                    meta.query_advice(decoded_rlc, Rotation::cur()),
+                    meta.query_advice(decoded_rlc, Rotation::prev()) * challenges.keccak_input()
+                        + meta.query_advice(decoded_byte, Rotation::cur()),
+                );
+
+                cb.gate(and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    not::expr(meta.query_advice(is_padding, Rotation::cur())),
+                    meta.query_advice(tag_gadget.is_output, Rotation::cur()),
+                ]))
+            },
+        );
+
+        debug_assert!(meta.degree() <= 9);
+
         meta.lookup(
             "DecompressionCircuit: decoded byte is in U8 range",
             |meta| {
@@ -562,7 +593,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         debug_assert!(meta.degree() <= 9);
 
         meta.lookup_any(
-            "DecompressionCircuit: lookup for tuple (tag, tag_next, max_len)",
+            "DecompressionCircuit: lookup for tuple (tag, tag_next, max_len, is_output)",
             |meta| {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
@@ -572,6 +603,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(tag_gadget.tag, Rotation::cur()),
                     meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
                     meta.query_advice(tag_gadget.max_len, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_output, Rotation::cur()),
                 ]
                 .into_iter()
                 .zip(tag_rom_table.table_exprs(meta))
@@ -876,22 +908,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
             });
 
-            // Validate that for an RLE block:
-            // - decoded_rlc calculation on the first row.
-            // - decoded_len_acc increment on the first row.
-            // - value_byte == decoded_byte.
+            // Validate that for an RLE block: value_byte == decoded_byte.
             cb.condition(block_type_bit0, |cb| {
-                cb.require_equal(
-                    "decoded_rlc calculation for RLE block's first row",
-                    meta.query_advice(decoded_rlc, Rotation(N_BLOCK_HEADER_BYTES as i32)),
-                    meta.query_advice(decoded_rlc, Rotation::cur()) * challenges.keccak_input()
-                        + meta.query_advice(decoded_byte, Rotation(N_BLOCK_HEADER_BYTES as i32)),
-                );
-                cb.require_equal(
-                    "decoded_len_acc increments",
-                    meta.query_advice(decoded_len_acc, Rotation(N_BLOCK_HEADER_BYTES as i32)),
-                    meta.query_advice(decoded_len_acc, Rotation::cur()) + 1.expr(),
-                );
                 cb.require_equal(
                     "for RLE block, value_byte == decoded_byte",
                     meta.query_advice(value_byte, Rotation(N_BLOCK_HEADER_BYTES as i32)),
@@ -1041,23 +1059,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 1.expr(),
             );
 
-            // Every row represents an uncompressed byte that is decoded as-is.
-            cb.require_equal(
-                "decoded_len_acc increments",
-                meta.query_advice(decoded_len_acc, Rotation::cur()),
-                meta.query_advice(decoded_len_acc, Rotation::prev()) + 1.expr(),
-            );
-
-            // TODO: change this. We can have an is_output boolean column which is constrained to
-            // be true for tags that output decoded bytes. Decoded RLC calculation can then be
-            // limited to a single gate where is_output == true.
-            cb.require_equal(
-                "decoded_rlc calculation",
-                meta.query_advice(decoded_rlc, Rotation::cur()),
-                meta.query_advice(decoded_rlc, Rotation::prev()) * challenges.keccak_input()
-                    + meta.query_advice(decoded_byte, Rotation::cur()),
-            );
-
             cb.require_equal(
                 "value byte == decoded byte",
                 meta.query_advice(value_byte, Rotation::cur()),
@@ -1103,23 +1104,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 "byte idx remains the same",
                 meta.query_advice(byte_idx, Rotation::cur()),
                 meta.query_advice(byte_idx, Rotation::prev()),
-            );
-
-            // Every row represents an uncompressed byte.
-            cb.require_equal(
-                "decoded_len_acc increments",
-                meta.query_advice(decoded_len_acc, Rotation::cur()),
-                meta.query_advice(decoded_len_acc, Rotation::prev()) + 1.expr(),
-            );
-
-            // TODO: change this. We can have an is_output boolean column which is constrained to
-            // be true for tags that output decoded bytes. Decoded RLC calculation can then be
-            // limited to a single gate where is_output == true.
-            cb.require_equal(
-                "decoded_rlc calculation",
-                meta.query_advice(decoded_rlc, Rotation::cur()),
-                meta.query_advice(decoded_rlc, Rotation::prev()) * challenges.keccak_input()
-                    + meta.query_advice(decoded_byte, Rotation::cur()),
             );
 
             cb.gate(and::expr([

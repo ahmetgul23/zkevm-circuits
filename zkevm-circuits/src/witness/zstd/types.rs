@@ -22,14 +22,40 @@ pub struct ZstdTagRomTableRow {
     tag_next: ZstdTag,
     /// The maximum number of bytes that are needed to represent the current tag.
     max_len: u64,
+    /// Whether this tag outputs a decoded byte or not.
+    is_output: bool,
 }
 
 impl ZstdTagRomTableRow {
+    pub(crate) fn rows() -> Vec<Self> {
+        use ZstdTag::{
+            BlockHeader, FrameContentSize, FrameHeaderDescriptor, RawBlockBytes, RleBlockBytes,
+            ZstdBlockLiteralsHeader,
+        };
+
+        [
+            (FrameHeaderDescriptor, FrameContentSize, 1, false),
+            (FrameContentSize, BlockHeader, 8, false),
+            (BlockHeader, RawBlockBytes, 3, false),
+            (BlockHeader, RleBlockBytes, 3, false),
+            (BlockHeader, ZstdBlockLiteralsHeader, 3, false),
+            // TODO: populate this
+        ]
+        .map(|(tag, tag_next, max_len, is_output)| ZstdTagRomTableRow {
+            tag,
+            tag_next,
+            max_len,
+            is_output,
+        })
+        .to_vec()
+    }
+
     pub(crate) fn values<F: Field>(&self) -> Vec<Value<F>> {
         vec![
             Value::known(F::from(usize::from(self.tag) as u64)),
             Value::known(F::from(usize::from(self.tag_next) as u64)),
             Value::known(F::from(self.max_len)),
+            Value::known(F::from(self.is_output as u64)),
         ]
     }
 }

@@ -1704,11 +1704,18 @@ pub struct ZstdTagRomTable {
     pub tag_next: Column<Fixed>,
     /// The maximum length in terms of number of bytes that the current tag can take up.
     pub max_len: Column<Fixed>,
+    /// Whether this tag outputs a decoded byte or not.
+    pub is_output: Column<Fixed>,
 }
 
 impl<F: Field> LookupTable<F> for ZstdTagRomTable {
     fn columns(&self) -> Vec<Column<Any>> {
-        vec![self.tag.into(), self.tag_next.into(), self.max_len.into()]
+        vec![
+            self.tag.into(),
+            self.tag_next.into(),
+            self.max_len.into(),
+            self.is_output.into(),
+        ]
     }
 
     fn annotations(&self) -> Vec<String> {
@@ -1716,6 +1723,7 @@ impl<F: Field> LookupTable<F> for ZstdTagRomTable {
             String::from("tag"),
             String::from("tag_next"),
             String::from("max_len"),
+            String::from("is_output"),
         ]
     }
 }
@@ -1727,6 +1735,7 @@ impl ZstdTagRomTable {
             tag: meta.fixed_column(),
             tag_next: meta.fixed_column(),
             max_len: meta.fixed_column(),
+            is_output: meta.fixed_column(),
         }
     }
 
@@ -1735,6 +1744,7 @@ impl ZstdTagRomTable {
         layouter.assign_region(
             || "Zstd ROM table",
             |mut region| {
+                // TODO: populate these rows.
                 let rows: Vec<ZstdTagRomTableRow> = Vec::new();
 
                 for (offset, row) in rows.iter().enumerate() {
@@ -1743,7 +1753,7 @@ impl ZstdTagRomTable {
                         .zip(row.values::<F>().into_iter())
                     {
                         region.assign_fixed(
-                            || format!("zstd rom table row: offset = {offset}"),
+                            || format!("zstd (tag) ROM table row: offset = {offset}"),
                             column,
                             offset,
                             || value,
