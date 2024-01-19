@@ -287,11 +287,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         is_tag!(is_raw_block, RawBlockBytes);
         is_tag!(is_rle_block, RleBlockBytes);
         is_tag!(is_zb_literals_header, ZstdBlockLiteralsHeader);
-        is_tag!(is_zb_huffman_header, ZstdBlockHuffmanHeader);
-        is_tag!(is_zb_fse_code, ZstdBlockFseCode);
         is_tag!(is_zb_huffman_code, ZstdBlockHuffmanCode);
         is_tag!(is_zb_jump_table, ZstdBlockJumpTable);
-        is_tag!(is_zb_lstream, Lstream);
+        is_tag!(is_zb_lstream, ZstdBlockLstream);
 
         let constrain_value_rlc =
             |meta: &mut VirtualCells<F>, cb: &mut BaseConstraintBuilder<F>, is_reverse: bool| {
@@ -1130,46 +1128,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
                 is_zb_literals_header(meta),
-            ]))
-        });
-
-        debug_assert!(meta.degree() <= 9);
-
-        ///////////////////////////////////////////////////////////////////////////////////////////
-        ///////////////////////////// ZstdTag::ZstdBlockHuffmanHeader /////////////////////////////
-        ///////////////////////////////////////////////////////////////////////////////////////////
-        meta.create_gate("DecompressionCircuit: ZstdBlockHuffmanHeader", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            cb.require_equal(
-                "is_block == True",
-                meta.query_advice(block_gadget.is_block, Rotation::cur()),
-                1.expr(),
-            );
-
-            cb.gate(and::expr([
-                meta.query_fixed(q_enable, Rotation::cur()),
-                is_zb_huffman_header(meta),
-            ]))
-        });
-
-        debug_assert!(meta.degree() <= 9);
-
-        ///////////////////////////////////////////////////////////////////////////////////////////
-        ///////////////////////////////// ZstdTag::ZstdBlockFseCode ///////////////////////////////
-        ///////////////////////////////////////////////////////////////////////////////////////////
-        meta.create_gate("DecompressionCircuit: ZstdBlockFseCode", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
-
-            cb.require_equal(
-                "is_block == True",
-                meta.query_advice(block_gadget.is_block, Rotation::cur()),
-                1.expr(),
-            );
-
-            cb.gate(and::expr([
-                meta.query_fixed(q_enable, Rotation::cur()),
-                is_zb_fse_code(meta),
             ]))
         });
 

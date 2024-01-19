@@ -440,60 +440,7 @@ fn process_block_zstd_literals_header<F: Field>() -> (usize, Vec<ZstdWitnessRow<
     unimplemented!();
 }
 
-fn process_block_zstd_huffman_header<F: Field>(
-    src: &[u8],
-    byte_offset: usize,
-    last_row: &ZstdWitnessRow<F>,
-    randomness: Value<F>,
-) -> (usize, Vec<ZstdWitnessRow<F>>) {
-    // A single byte (header_byte) is read.
-    // - if header_byte < 128: canonical weights are represented by FSE table.
-    // - if header_byte >= 128: canonical weights are given by direct representation.
-
-    let header_byte = src
-        .get(byte_offset)
-        .expect("ZBHuffmanHeader byte should exist");
-
-    assert!(
-        *header_byte < 128,
-        "we expect canonical huffman weights to be encoded using FSE"
-    );
-
-    let value_rlc =
-        last_row.encoded_data.value_rlc * randomness + Value::known(F::from(*header_byte as u64));
-
-    (
-        byte_offset + 1,
-        vec![ZstdWitnessRow {
-            state: ZstdState {
-                tag: ZstdTag::ZstdBlockHuffmanHeader,
-                tag_next: ZstdTag::ZstdBlockFseCode,
-                tag_len: 1,
-                tag_idx: 1,
-                tag_value: Value::known(F::from(*header_byte as u64)),
-                tag_value_acc: Value::known(F::from(*header_byte as u64)),
-            },
-            encoded_data: EncodedData {
-                byte_idx: (byte_offset + 1) as u64,
-                encoded_len: last_row.encoded_data.encoded_len,
-                value_byte: *header_byte,
-                value_rlc,
-                ..Default::default()
-            },
-            decoded_data: last_row.decoded_data.clone(),
-            fse_data: FseTableRow::default(),
-            huffman_data: HuffmanData::default(),
-        }],
-    )
-}
-
-#[allow(unused_variables)]
-fn process_block_zstd_fse<F: Field>(
-    src: &[u8],
-    byte_offset: usize,
-    last_row: &ZstdWitnessRow<F>,
-    randomness: Value<F>,
-) -> (usize, Vec<ZstdWitnessRow<F>>) {
+fn process_block_zstd_fse<F: Field>() -> (usize, Vec<ZstdWitnessRow<F>>) {
     unimplemented!()
 }
 
