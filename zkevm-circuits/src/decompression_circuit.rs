@@ -27,7 +27,7 @@ use halo2_proofs::{
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::{
-        decompression::{ZstdBlockTypeRomTable, ZstdTagRomTable},
+        decompression::{BlockTypeRomTable, LiteralsHeaderRomTable, TagRomTable},
         KeccakTable, LookupTable, Pow2Table, RangeTable, U8Table,
     },
     util::{Challenges, SubCircuit, SubCircuitConfig},
@@ -92,6 +92,8 @@ pub struct DecompressionCircuitConfig<F> {
     tag_gadget: TagGadget<F>,
     /// Columns used to process bytes back-to-front.
     reverse_chunk: ReverseChunk,
+    /// Auxiliary columns, multi-purpose depending on the current tag.
+    aux_fields: AuxFields,
 
     /// The range table to check value is byte.
     u8_table: U8Table,
@@ -161,6 +163,18 @@ pub struct ReverseChunk {
     rand_pow: Column<Advice>,
 }
 
+/// Auxiliary columns that can be used for different purposes given the current tag that we are
+/// decoding.
+#[derive(Clone, Debug)]
+pub struct AuxFields {
+    /// Auxiliary column 1.
+    aux1: Column<Advice>,
+    /// Auxiliary column 2.
+    aux2: Column<Advice>,
+    /// Auxiliary column 3.
+    aux3: Column<Advice>,
+}
+
 impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
     type ConfigArgs = DecompressionCircuitConfigArgs<F>;
 
@@ -201,8 +215,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         }: Self::ConfigArgs,
     ) -> Self {
         // Create the fixed columns read-only memory table for zstd (tag, tag_next, max_len).
-        let tag_rom_table = ZstdTagRomTable::construct(meta);
-        let block_type_rom_table = ZstdBlockTypeRomTable::construct(meta);
+        let tag_rom_table = TagRomTable::construct(meta);
+        let block_type_rom_table = BlockTypeRomTable::construct(meta);
+        let literals_header_rom_table = LiteralsHeaderRomTable::construct(meta);
 
         let q_enable = meta.fixed_column();
         let q_first = meta.fixed_column();
@@ -269,9 +284,15 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             value_rlc_chunk: meta.advice_column_in(SecondPhase),
             rand_pow: meta.advice_column(),
         };
+        let aux_fields = AuxFields {
+            aux1: meta.advice_column(),
+            aux2: meta.advice_column(),
+            aux3: meta.advice_column(),
+        };
 
         macro_rules! is_tag {
             ($var:ident, $tag_variant:ident) => {
+                #[allow(unused_variables)]
                 let $var = |meta: &mut VirtualCells<F>| {
                     tag_gadget
                         .tag_bits
@@ -287,9 +308,12 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         is_tag!(is_raw_block, RawBlockBytes);
         is_tag!(is_rle_block, RleBlockBytes);
         is_tag!(is_zb_literals_header, ZstdBlockLiteralsHeader);
+        is_tag!(is_zb_raw_block, ZstdBlockLiteralsRawBytes);
+        is_tag!(is_zb_rle_block, ZstdBlockLiteralsRleBytes);
         is_tag!(is_zb_huffman_code, ZstdBlockHuffmanCode);
         is_tag!(is_zb_jump_table, ZstdBlockJumpTable);
         is_tag!(is_zb_lstream, ZstdBlockLstream);
+        is_tag!(is_zb_sequence_header, ZstdBlockSequenceHeader);
 
         let constrain_value_rlc =
             |meta: &mut VirtualCells<F>, cb: &mut BaseConstraintBuilder<F>, is_reverse: bool| {
@@ -1033,9 +1057,10 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     is_block_header(meta),
                 ]);
                 vec![
+                    meta.query_advice(tag_gadget.tag, Rotation::cur()),
                     meta.query_advice(value_bits[6], Rotation::cur()),
                     meta.query_advice(value_bits[5], Rotation::cur()),
-                    meta.query_advice(tag_gadget.tag, Rotation(N_BLOCK_HEADER_BYTES as i32)),
+                    meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
                 ]
                 .into_iter()
                 .zip(block_type_rom_table.table_exprs(meta))
@@ -1125,11 +1150,64 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 1.expr(),
             );
 
+            let block_type_bit0 = meta.query_advice(value_bits[7], Rotation::cur());
+            let block_type_bit1 = meta.query_advice(value_bits[6], Rotation::cur());
+            cb.require_zero(
+                "block type cannot be TREELESS, i.e. block_type == 3 not possible",
+                block_type_bit0 * block_type_bit1,
+            );
+
             cb.gate(and::expr([
                 meta.query_fixed(q_enable, Rotation::cur()),
+                meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
                 is_zb_literals_header(meta),
             ]))
         });
+        meta.lookup_any(
+            "DecompressionCircuit: lookup for tuple (zstd_block_type, tag_next)",
+            |meta| {
+                let condition = and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                    is_zb_literals_header(meta),
+                ]);
+                vec![
+                    meta.query_advice(tag_gadget.tag, Rotation::cur()),
+                    meta.query_advice(value_bits[7], Rotation::cur()),
+                    meta.query_advice(value_bits[6], Rotation::cur()),
+                    meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
+                ]
+                .into_iter()
+                .zip(block_type_rom_table.table_exprs(meta))
+                .map(|(arg, table)| (condition.expr() * arg, table))
+                .collect()
+            },
+        );
+        meta.lookup_any(
+            "DecompressionCircuit: lookup for LiteralsHeader decomposition",
+            |meta| {
+                let condition = and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                    is_zb_literals_header(meta),
+                ]);
+                vec![
+                    meta.query_advice(value_bits[7], Rotation::cur()), // block type bit0
+                    meta.query_advice(value_bits[6], Rotation::cur()), // block type bit1
+                    meta.query_advice(value_bits[5], Rotation::cur()), // size format bit0
+                    meta.query_advice(value_bits[4], Rotation::cur()), // size format bit1
+                    meta.query_advice(aux_fields.aux1, Rotation::cur()), // regenerated size
+                    meta.query_advice(aux_fields.aux2, Rotation::cur()), // compressed size
+                    meta.query_advice(tag_gadget.tag_len, Rotation::cur()), /* size of literals
+                                                                             * header */
+                    meta.query_advice(aux_fields.aux3, Rotation::cur()), // number of lstreams
+                ]
+                .into_iter()
+                .zip(literals_header_rom_table.table_exprs(meta))
+                .map(|(arg, table)| (condition.expr() * arg, table))
+                .collect()
+            },
+        );
 
         debug_assert!(meta.degree() <= 9);
 
@@ -1209,6 +1287,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             block_gadget,
             tag_gadget,
             reverse_chunk,
+            aux_fields,
             u8_table,
         }
     }

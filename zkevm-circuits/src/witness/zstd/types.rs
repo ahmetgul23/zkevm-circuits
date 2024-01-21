@@ -31,10 +31,10 @@ impl ZstdTagRomTableRow {
         use ZstdTag::{
             BlockHeader, FrameContentSize, FrameHeaderDescriptor, Null, RawBlockBytes,
             RleBlockBytes, ZstdBlockHuffmanCode, ZstdBlockJumpTable, ZstdBlockLiteralsHeader,
-            ZstdBlockLstream,
+            ZstdBlockLiteralsRawBytes, ZstdBlockLiteralsRleBytes, ZstdBlockLstream,
+            ZstdBlockSequenceHeader,
         };
 
-        // TODO: sequences header and sequences section.
         [
             (FrameHeaderDescriptor, FrameContentSize, 1, false),
             (FrameContentSize, BlockHeader, 8, false),
@@ -45,11 +45,26 @@ impl ZstdTagRomTableRow {
             (RawBlockBytes, Null, 8388607, true),
             (RleBlockBytes, BlockHeader, 8388607, true),
             (RleBlockBytes, Null, 8388607, true),
+            (ZstdBlockLiteralsHeader, ZstdBlockLiteralsRawBytes, 5, false),
+            (ZstdBlockLiteralsHeader, ZstdBlockLiteralsRleBytes, 5, false),
+            (
+                ZstdBlockLiteralsRawBytes,
+                ZstdBlockSequenceHeader,
+                1048575,
+                true,
+            ), // (1 << 20) - 1
+            (
+                ZstdBlockLiteralsRleBytes,
+                ZstdBlockSequenceHeader,
+                1048575,
+                true,
+            ),
             (ZstdBlockLiteralsHeader, ZstdBlockHuffmanCode, 5, false),
             (ZstdBlockHuffmanCode, ZstdBlockJumpTable, 128, false), // header_byte < 128
             (ZstdBlockHuffmanCode, ZstdBlockLstream, 128, false),
             (ZstdBlockJumpTable, ZstdBlockLstream, 6, false),
             (ZstdBlockLstream, ZstdBlockLstream, 1000, true), // 1kB hard-limit
+            (ZstdBlockLstream, ZstdBlockSequenceHeader, 1000, true),
         ]
         .map(|(tag, tag_next, max_len, is_output)| ZstdTagRomTableRow {
             tag,
@@ -157,12 +172,18 @@ pub enum ZstdTag {
     RleBlockBytes,
     /// Zstd block's literals header.
     ZstdBlockLiteralsHeader,
+    /// Zstd blocks might contain raw bytes.
+    ZstdBlockLiteralsRawBytes,
+    /// Zstd blocks might contain rle bytes.
+    ZstdBlockLiteralsRleBytes,
     /// Zstd block's huffman code.
     ZstdBlockHuffmanCode,
     /// Zstd block's jump table.
     ZstdBlockJumpTable,
     /// Literal stream.
     ZstdBlockLstream,
+    /// Beginning of sequence section.
+    ZstdBlockSequenceHeader,
 }
 
 impl_expr!(ZstdTag);
@@ -183,9 +204,12 @@ impl ToString for ZstdTag {
             Self::RawBlockBytes => "RawBlockBytes",
             Self::RleBlockBytes => "RleBlockBytes",
             Self::ZstdBlockLiteralsHeader => "ZstdBlockLiteralsHeader",
+            Self::ZstdBlockLiteralsRawBytes => "ZstdBlockLiteralsRawBytes",
+            Self::ZstdBlockLiteralsRleBytes => "ZstdBlockLiteralsRleBytes",
             Self::ZstdBlockHuffmanCode => "ZstdBlockHuffmanCode",
             Self::ZstdBlockJumpTable => "ZstdBlockJumpTable",
             Self::ZstdBlockLstream => "ZstdBlockLstream",
+            Self::ZstdBlockSequenceHeader => "ZstdBlockSequenceHeader",
         })
     }
 }
