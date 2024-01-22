@@ -1850,6 +1850,9 @@ impl LiteralsHeaderTable {
                     "branch0: compressed size",
                     meta.query_advice(table.compr_size, Rotation::cur()),
                 );
+                for col in [table.byte1, table.byte2, table.byte3, table.byte4] {
+                    cb.require_zero("byte[i] == 0", meta.query_advice(col, Rotation::cur()));
+                }
             });
 
             // regen_size == (lh_byte[0] >> 4) + (lh_byte[1] << 4).
@@ -1864,6 +1867,9 @@ impl LiteralsHeaderTable {
                     "branch1: compressed size",
                     meta.query_advice(table.compr_size, Rotation::cur()),
                 );
+                for col in [table.byte2, table.byte3, table.byte4] {
+                    cb.require_zero("byte[i] == 0", meta.query_advice(col, Rotation::cur()));
+                }
             });
 
             // regen_size == (lh_byte[0] >> 4) + (lh_byte[1] << 4) + (lh_byte[2] << 12).
@@ -1878,6 +1884,9 @@ impl LiteralsHeaderTable {
                     "branch2: compressed size",
                     meta.query_advice(table.compr_size, Rotation::cur()),
                 );
+                for col in [table.byte3, table.byte4] {
+                    cb.require_zero("byte[i] == 0", meta.query_advice(col, Rotation::cur()));
+                }
             });
 
             // regen_size == (lh_byte[0] >> 4) + ((lh_byte[1] & 0b111111) << 4).
@@ -1893,6 +1902,9 @@ impl LiteralsHeaderTable {
                     meta.query_advice(table.compr_size, Rotation::cur()),
                     byte1_rs_6 + byte2_ls_2.expr(),
                 );
+                for col in [table.byte3, table.byte4] {
+                    cb.require_zero("byte[i] == 0", meta.query_advice(col, Rotation::cur()));
+                }
             });
 
             // regen_size == (lh_byte[0] >> 4) + (lh_byte[1] << 4) + ((lh_byte[2] & 0b11) << 12).
@@ -1907,6 +1919,10 @@ impl LiteralsHeaderTable {
                     "branch4: compressed size",
                     meta.query_advice(table.compr_size, Rotation::cur()),
                     byte2_rs_2 + byte3_ls_6,
+                );
+                cb.require_zero(
+                    "byte[i] == 0",
+                    meta.query_advice(table.byte4, Rotation::cur()),
                 );
             });
 
@@ -2026,6 +2042,54 @@ impl LiteralsHeaderTable {
         });
 
         table
+    }
+
+    /// Assign witness to the literals header table.
+    pub fn dev_load<F: Field>(
+        &self,
+        layouter: &mut impl Layouter<F>,
+        literals_headers: Vec<Vec<u8>>,
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "LiteralsHeaderTable",
+            |mut region| {
+                for (i, header) in literals_headers.iter().enumerate() {
+                    let n_bytes_header = header.len();
+                    // TODO
+                }
+                Ok(())
+            },
+        )
+    }
+}
+
+impl<F: Field> LookupTable<F> for LiteralsHeaderTable {
+    fn columns(&self) -> Vec<Column<Any>> {
+        vec![
+            self.byte_offset.into(),
+            self.branch.into(),
+            self.byte0.into(),
+            self.byte1.into(),
+            self.byte2.into(),
+            self.byte3.into(),
+            self.byte4.into(),
+            self.regen_size.into(),
+            self.compr_size.into(),
+        ]
+    }
+
+    fn annotations(&self) -> Vec<String> {
+        vec![
+            String::from("byte_offset"),
+            String::from("branch"),
+            String::from("byte0"),
+            String::from("byte1"),
+            String::from("byte2"),
+            String::from("byte3"),
+            String::from("byte4"),
+            String::from("regen_size"),
+            String::from("compr_size"),
+        ]
     }
 }
 
