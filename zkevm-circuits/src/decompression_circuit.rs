@@ -292,7 +292,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
 
         macro_rules! is_tag {
             ($var:ident, $tag_variant:ident) => {
-                #[allow(unused_variables)]
                 let $var = |meta: &mut VirtualCells<F>| {
                     tag_gadget
                         .tag_bits
@@ -1262,6 +1261,46 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 .collect()
             },
         );
+
+        debug_assert!(meta.degree() <= 9);
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////// ZstdTag::ZstdBlockLiteralsRawBytes ////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlock Raw bytes", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_equal(
+                "is_block == True",
+                meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                1.expr(),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_raw_block(meta),
+            ]))
+        });
+
+        debug_assert!(meta.degree() <= 9);
+
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        /////////////////////////// ZstdTag::ZstdBlockLiteralsRleBytes ////////////////////////////
+        ///////////////////////////////////////////////////////////////////////////////////////////
+        meta.create_gate("DecompressionCircuit: ZstdBlock RLE bytes", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            cb.require_equal(
+                "is_block == True",
+                meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                1.expr(),
+            );
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                is_zb_rle_block(meta),
+            ]))
+        });
 
         debug_assert!(meta.degree() <= 9);
 

@@ -20,8 +20,8 @@ use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::BitwiseOp,
     witness::{
-        FseAuxiliaryTableData, FseSymbol, FseTableData, HuffmanCodesData, ZstdTag,
-        ZstdTagRomTableRow, N_BITS_SYMBOL, N_MAX_SYMBOLS,
+        FseAuxiliaryTableData, FseSymbol, FseTableData, HuffmanCodesData, TagRomTableRow, ZstdTag,
+        N_BITS_SYMBOL, N_MAX_SYMBOLS,
     },
 };
 
@@ -1745,7 +1745,7 @@ impl TagRomTable {
             || "Zstd ROM table",
             |mut region| {
                 // TODO: populate these rows.
-                let rows: Vec<ZstdTagRomTableRow> = Vec::new();
+                let rows: Vec<TagRomTableRow> = Vec::new();
 
                 for (offset, row) in rows.iter().enumerate() {
                     for (&column, (value, annotation)) in
