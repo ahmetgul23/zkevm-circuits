@@ -2289,14 +2289,21 @@ pub struct LiteralsHeaderRomTable {
     size_format_bit0: Column<Fixed>,
     /// Size format second bit.
     size_format_bit1: Column<Fixed>,
-    /// Number of bits used for regenerated size.
-    regen_size_bits: Column<Fixed>,
-    /// Number of bits used for compressed size.
-    compr_size_bits: Column<Fixed>,
     /// Number of bytes occupied by the literals header.
     n_bytes_header: Column<Fixed>,
     /// Number of literal streams to be decoded.
     n_lstreams: Column<Fixed>,
+    /// The branch we take to decompose the literals header. There are a total of 7 branches that
+    /// can be used to decompose the literals header, namely:
+    ///
+    /// - block_type == Raw/RLE and size_format == 00 or 10
+    /// - block_type == Raw/RLE and size_format == 01
+    /// - block_type == Raw/RLE and size_format == 11
+    /// - block_type == Compressed and size_format == 00
+    /// - block_type == Compressed and size_format == 01
+    /// - block_type == Compressed and size_format == 10
+    /// - block_type == Compressed and size_format == 11
+    branch: Column<Fixed>,
 }
 
 impl<F: Field> LookupTable<F> for LiteralsHeaderRomTable {
@@ -2306,10 +2313,9 @@ impl<F: Field> LookupTable<F> for LiteralsHeaderRomTable {
             self.block_type_bit1.into(),
             self.size_format_bit0.into(),
             self.size_format_bit1.into(),
-            self.regen_size_bits.into(),
-            self.compr_size_bits.into(),
             self.n_bytes_header.into(),
             self.n_lstreams.into(),
+            self.branch.into(),
         ]
     }
 
@@ -2319,10 +2325,9 @@ impl<F: Field> LookupTable<F> for LiteralsHeaderRomTable {
             String::from("block_type_bit1"),
             String::from("size_format_bit0"),
             String::from("size_format_bit1"),
-            String::from("regen_size_bits"),
-            String::from("compr_size_bits"),
             String::from("n_bytes_header"),
             String::from("n_lstreams"),
+            String::from("branch"),
         ]
     }
 }
@@ -2335,10 +2340,9 @@ impl LiteralsHeaderRomTable {
             block_type_bit1: meta.fixed_column(),
             size_format_bit0: meta.fixed_column(),
             size_format_bit1: meta.fixed_column(),
-            regen_size_bits: meta.fixed_column(),
-            compr_size_bits: meta.fixed_column(),
             n_bytes_header: meta.fixed_column(),
             n_lstreams: meta.fixed_column(),
+            branch: meta.fixed_column(),
         }
     }
 
@@ -2349,18 +2353,18 @@ impl LiteralsHeaderRomTable {
             |mut region| {
                 // Refer: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#literals_section_header
                 for (i, row) in [
-                    [0, 0, 0, 0, 5, 0, 1, 1],   // Raw: 1 byte header
-                    [0, 0, 0, 1, 5, 0, 1, 1],   // Raw: 1 byte header
-                    [0, 0, 1, 0, 12, 0, 2, 1],  // Raw: 2 bytes header
-                    [0, 0, 1, 1, 20, 0, 3, 1],  // Raw: 3 bytes header
-                    [1, 0, 0, 0, 5, 0, 1, 1],   // RLE: 1 byte header
-                    [1, 0, 0, 1, 5, 0, 1, 1],   // RLE: 1 byte header
-                    [1, 0, 1, 0, 12, 0, 2, 1],  // RLE: 2 bytes header
-                    [1, 0, 1, 1, 20, 0, 3, 1],  // RLE: 3 bytes header
-                    [0, 1, 0, 0, 10, 10, 3, 1], // Compressed: 3 bytes header
-                    [0, 1, 1, 0, 10, 10, 3, 4], // Compressed: 3 bytes header
-                    [0, 1, 0, 1, 14, 14, 4, 4], // Compressed: 4 bytes header
-                    [0, 1, 1, 1, 18, 18, 5, 4], // Compressed: 5 bytes header
+                    [0, 0, 0, 0, 1, 1, 0], // Raw: 1 byte header
+                    [0, 0, 0, 1, 1, 1, 0], // Raw: 1 byte header
+                    [0, 0, 1, 0, 2, 1, 1], // Raw: 2 bytes header
+                    [0, 0, 1, 1, 3, 1, 2], // Raw: 3 bytes header
+                    [1, 0, 0, 0, 1, 1, 0], // RLE: 1 byte header
+                    [1, 0, 0, 1, 1, 1, 0], // RLE: 1 byte header
+                    [1, 0, 1, 0, 2, 1, 1], // RLE: 2 bytes header
+                    [1, 0, 1, 1, 3, 1, 2], // RLE: 3 bytes header
+                    [0, 1, 0, 0, 3, 1, 3], // Compressed: 3 bytes header
+                    [0, 1, 1, 0, 3, 4, 4], // Compressed: 3 bytes header
+                    [0, 1, 0, 1, 4, 4, 5], // Compressed: 4 bytes header
+                    [0, 1, 1, 1, 5, 4, 6], // Compressed: 5 bytes header
                 ]
                 .iter()
                 .enumerate()

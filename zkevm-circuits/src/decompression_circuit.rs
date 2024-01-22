@@ -27,7 +27,9 @@ use halo2_proofs::{
 use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::{
-        decompression::{BlockTypeRomTable, LiteralsHeaderRomTable, TagRomTable},
+        decompression::{
+            BlockTypeRomTable, LiteralsHeaderRomTable, LiteralsHeaderTable, TagRomTable,
+        },
         KeccakTable, LookupTable, Pow2Table, RangeTable, U8Table,
     },
     util::{Challenges, SubCircuit, SubCircuitConfig},
@@ -38,6 +40,8 @@ use crate::{
 pub struct DecompressionCircuitConfigArgs<F> {
     /// Challenge API.
     pub challenges: Challenges<Expression<F>>,
+    /// Lookup table to get regenerated and compressed size from LiteralsHeader.
+    pub literals_header_table: LiteralsHeaderTable,
     /// U8 table, i.e. RangeTable for [0, 1 << 8).
     pub u8_table: U8Table,
     /// RangeTable for [0, 8).
@@ -173,6 +177,8 @@ pub struct AuxFields {
     aux2: Column<Advice>,
     /// Auxiliary column 3.
     aux3: Column<Advice>,
+    /// Auxiliary column 4.
+    aux4: Column<Advice>,
 }
 
 impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
@@ -208,6 +214,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         meta: &mut ConstraintSystem<F>,
         Self::ConfigArgs {
             challenges,
+            literals_header_table,
             u8_table,
             range_table_0x08,
             pow2_table,
@@ -288,6 +295,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             aux1: meta.advice_column(),
             aux2: meta.advice_column(),
             aux3: meta.advice_column(),
+            aux4: meta.advice_column(),
         };
 
         macro_rules! is_tag {
@@ -1249,14 +1257,84 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(value_bits[6], Rotation::cur()), // block type bit1
                     meta.query_advice(value_bits[5], Rotation::cur()), // size format bit0
                     meta.query_advice(value_bits[4], Rotation::cur()), // size format bit1
-                    meta.query_advice(aux_fields.aux1, Rotation::cur()), // regenerated size
-                    meta.query_advice(aux_fields.aux2, Rotation::cur()), // compressed size
-                    meta.query_advice(tag_gadget.tag_len, Rotation::cur()), /* size of literals
-                                                                        * header */
-                    meta.query_advice(aux_fields.aux3, Rotation::cur()), // number of lstreams
+                    meta.query_advice(tag_gadget.tag_len, Rotation::cur()), // num bytes header
+                    meta.query_advice(aux_fields.aux3, Rotation::cur()), // num of lstreams
+                    meta.query_advice(aux_fields.aux4, Rotation::cur()), // branch to take
                 ]
                 .into_iter()
                 .zip(literals_header_rom_table.table_exprs(meta))
+                .map(|(arg, table)| (condition.expr() * arg, table))
+                .collect()
+            },
+        );
+        meta.lookup_any(
+            "DecompressionCircuit: lookup for LiteralsHeader regen/compr size",
+            |meta| {
+                let condition = and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                    is_zb_literals_header(meta),
+                ]);
+
+                // Which branch are we taking in the literals header decomposition.
+                let branch = meta.query_advice(aux_fields.aux4, Rotation::cur());
+                // Is it the case of zstd compressed block, i.e. block type == 0b10.
+                let is_compressed = meta.query_advice(value_bits[6], Rotation::cur());
+                // Is the size format == 0b11.
+                let is_size_format_0b11 = and::expr([
+                    meta.query_advice(value_bits[5], Rotation::cur()),
+                    meta.query_advice(value_bits[4], Rotation::cur()),
+                ]);
+                let byte0 = meta.query_advice(value_byte, Rotation::cur());
+                let byte1 = select::expr(
+                    is_compressed.expr(),
+                    meta.query_advice(value_byte, Rotation(1)),
+                    select::expr(
+                        meta.query_advice(value_bits[5], Rotation::cur()),
+                        meta.query_advice(value_byte, Rotation(1)),
+                        0.expr(),
+                    ),
+                );
+                let byte2 = select::expr(
+                    is_compressed.expr(),
+                    meta.query_advice(value_byte, Rotation(2)),
+                    select::expr(
+                        meta.query_advice(value_bits[5], Rotation::cur()),
+                        meta.query_advice(value_byte, Rotation(2)),
+                        0.expr(),
+                    ),
+                );
+                let byte3 = select::expr(
+                    is_compressed.expr(),
+                    select::expr(
+                        meta.query_advice(value_bits[5], Rotation::cur()),
+                        meta.query_advice(value_byte, Rotation(3)),
+                        0.expr(),
+                    ),
+                    0.expr(),
+                );
+                let byte4 = select::expr(
+                    is_compressed,
+                    select::expr(
+                        is_size_format_0b11,
+                        meta.query_advice(value_byte, Rotation(4)),
+                        0.expr(),
+                    ),
+                    0.expr(),
+                );
+                vec![
+                    meta.query_advice(byte_idx, Rotation::cur()), // byte offset
+                    branch,                                       // branch
+                    byte0,                                        // byte0
+                    byte1,                                        // byte1
+                    byte2,                                        // byte2
+                    byte3,                                        // byte3
+                    byte4,                                        // byte4
+                    meta.query_advice(aux_fields.aux1, Rotation::cur()), // regenerated size
+                    meta.query_advice(aux_fields.aux2, Rotation::cur()), // compressed size
+                ]
+                .into_iter()
+                .zip(literals_header_table.table_exprs(meta))
                 .map(|(arg, table)| (condition.expr() * arg, table))
                 .collect()
             },

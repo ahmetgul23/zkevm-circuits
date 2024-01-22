@@ -8,7 +8,10 @@ use crate::{
     decompression_circuit::{
         DecompressionCircuit, DecompressionCircuitConfig, DecompressionCircuitConfigArgs,
     },
-    table::{KeccakTable, Pow2Table, RangeTable, U8Table},
+    table::{
+        decompression::LiteralsHeaderTable, BitwiseOpTable, KeccakTable, Pow2Table, RangeTable,
+        U8Table,
+    },
     util::{Challenges, SubCircuit, SubCircuitConfig},
 };
 
@@ -26,16 +29,29 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
         let challenges = Challenges::construct(meta);
         let challenge_exprs = challenges.exprs(meta);
         let u8_table = U8Table::construct(meta);
-        let range_table_0x08 = RangeTable::construct(meta);
+        let bitwise_op_table = BitwiseOpTable::construct(meta);
+        let range4 = RangeTable::construct(meta);
+        let range8 = RangeTable::construct(meta);
+        let range16 = RangeTable::construct(meta);
+        let range64 = RangeTable::construct(meta);
         let pow2_table = Pow2Table::construct(meta);
         let keccak_table = KeccakTable::construct(meta);
+        let literals_header_table = LiteralsHeaderTable::construct(
+            meta,
+            bitwise_op_table,
+            range4,
+            range8,
+            range16,
+            range64,
+        );
 
         let config = DecompressionCircuitConfig::new(
             meta,
             DecompressionCircuitConfigArgs {
                 challenges: challenge_exprs,
+                literals_header_table,
                 u8_table,
-                range_table_0x08,
+                range_table_0x08: range8,
                 pow2_table,
                 keccak_table,
             },
