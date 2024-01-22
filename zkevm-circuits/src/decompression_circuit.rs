@@ -1209,7 +1209,12 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     1.expr(),
                 );
 
-                for col in [aux_fields.aux1, aux_fields.aux2, aux_fields.aux3] {
+                for col in [
+                    aux_fields.aux1,
+                    aux_fields.aux2,
+                    aux_fields.aux3,
+                    aux_fields.aux4,
+                ] {
                     cb.require_equal(
                         "aux fields remain the same",
                         meta.query_advice(col, Rotation::cur()),
