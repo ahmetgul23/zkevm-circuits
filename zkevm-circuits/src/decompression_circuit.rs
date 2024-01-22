@@ -491,11 +491,36 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     "tag_value_acc' check",
                     tag_value_acc_next,
                     select::expr(
-                        is_new_byte,
+                        is_new_byte.expr(),
                         tag_value_acc_curr.expr() * multiplier
                             + meta.query_advice(value_byte, Rotation::next()),
                         tag_value_acc_curr,
                     ),
+                );
+                cb.require_equal(
+                    "tag_idx' check",
+                    meta.query_advice(tag_gadget.tag_idx, Rotation::next()),
+                    meta.query_advice(tag_gadget.tag_idx, Rotation::cur()) + is_new_byte,
+                );
+                cb.require_equal(
+                    "tag' == tag",
+                    meta.query_advice(tag_gadget.tag, Rotation::next()),
+                    meta.query_advice(tag_gadget.tag, Rotation::cur()),
+                );
+                cb.require_equal(
+                    "tag_next' == tag_next",
+                    meta.query_advice(tag_gadget.tag_next, Rotation::next()),
+                    meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
+                );
+                cb.require_equal(
+                    "tag_len' == tag_len",
+                    meta.query_advice(tag_gadget.tag_len, Rotation::next()),
+                    meta.query_advice(tag_gadget.tag_len, Rotation::cur()),
+                );
+                cb.require_equal(
+                    "tag_value' == tag_value",
+                    meta.query_advice(tag_gadget.tag_value, Rotation::next()),
+                    meta.query_advice(tag_gadget.tag_value, Rotation::cur()),
                 );
             });
 
@@ -1141,28 +1166,57 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         ///////////////////////////// ZstdTag::ZstdBlockLiteralsHeader ////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
-        meta.create_gate("DecompressionCircuit: ZstdBlockLiteralsHeader", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
+        meta.create_gate(
+            "DecompressionCircuit: ZstdBlockLiteralsHeader (first byte)",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
 
-            cb.require_equal(
-                "is_block == True",
-                meta.query_advice(block_gadget.is_block, Rotation::cur()),
-                1.expr(),
-            );
+                cb.require_equal(
+                    "is_block == True",
+                    meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                    1.expr(),
+                );
 
-            let block_type_bit0 = meta.query_advice(value_bits[7], Rotation::cur());
-            let block_type_bit1 = meta.query_advice(value_bits[6], Rotation::cur());
-            cb.require_zero(
-                "block type cannot be TREELESS, i.e. block_type == 3 not possible",
-                block_type_bit0 * block_type_bit1,
-            );
+                let block_type_bit0 = meta.query_advice(value_bits[7], Rotation::cur());
+                let block_type_bit1 = meta.query_advice(value_bits[6], Rotation::cur());
+                cb.require_zero(
+                    "block type cannot be TREELESS, i.e. block_type == 3 not possible",
+                    block_type_bit0 * block_type_bit1,
+                );
 
-            cb.gate(and::expr([
-                meta.query_fixed(q_enable, Rotation::cur()),
-                meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
-                is_zb_literals_header(meta),
-            ]))
-        });
+                cb.gate(and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                    is_zb_literals_header(meta),
+                ]))
+            },
+        );
+        meta.create_gate(
+            "DecompressionCircuit: ZstdBlockLiteralsHeader (other bytes)",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
+
+                cb.require_equal(
+                    "is_block == True",
+                    meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                    1.expr(),
+                );
+
+                for col in [aux_fields.aux1, aux_fields.aux2, aux_fields.aux3] {
+                    cb.require_equal(
+                        "aux fields remain the same",
+                        meta.query_advice(col, Rotation::cur()),
+                        meta.query_advice(col, Rotation::prev()),
+                    );
+                }
+
+                cb.gate(and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    is_zb_literals_header(meta),
+                ]))
+            },
+        );
         meta.lookup_any(
             "DecompressionCircuit: lookup for tuple (zstd_block_type, tag_next)",
             |meta| {
@@ -1199,7 +1253,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(aux_fields.aux1, Rotation::cur()), // regenerated size
                     meta.query_advice(aux_fields.aux2, Rotation::cur()), // compressed size
                     meta.query_advice(tag_gadget.tag_len, Rotation::cur()), /* size of literals
-                                                                             * header */
+                                                                        * header */
                     meta.query_advice(aux_fields.aux3, Rotation::cur()), // number of lstreams
                 ]
                 .into_iter()
@@ -1214,20 +1268,42 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         ///////////////////////////////////////////////////////////////////////////////////////////
         /////////////////////////////// ZstdTag::ZstdBlockHuffmanCode /////////////////////////////
         ///////////////////////////////////////////////////////////////////////////////////////////
-        meta.create_gate("DecompressionCircuit: ZstdBlockHuffmanCode", |meta| {
-            let mut cb = BaseConstraintBuilder::default();
+        meta.create_gate(
+            "DecompressionCircuit: ZstdBlockHuffmanCode (huffman header)",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
 
-            cb.require_equal(
-                "is_block == True",
-                meta.query_advice(block_gadget.is_block, Rotation::cur()),
-                1.expr(),
-            );
+                cb.require_equal(
+                    "is_block == True",
+                    meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                    1.expr(),
+                );
 
-            cb.gate(and::expr([
-                meta.query_fixed(q_enable, Rotation::cur()),
-                is_zb_huffman_code(meta),
-            ]))
-        });
+                cb.gate(and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                    is_zb_huffman_code(meta),
+                ]))
+            },
+        );
+        meta.create_gate(
+            "DecompressionCircuit: ZstdBlockHuffmanCode (fse code and huffman code)",
+            |meta| {
+                let mut cb = BaseConstraintBuilder::default();
+
+                cb.require_equal(
+                    "is_block == True",
+                    meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                    1.expr(),
+                );
+
+                cb.gate(and::expr([
+                    meta.query_fixed(q_enable, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    is_zb_huffman_code(meta),
+                ]))
+            },
+        );
 
         debug_assert!(meta.degree() <= 9);
 
