@@ -1502,24 +1502,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 ]))
             },
         );
-        meta.create_gate(
-            "DecompressionCircuit: ZstdBlock RLE bytes (other bytes)",
-            |meta| {
-                let mut cb = BaseConstraintBuilder::default();
-
-                cb.require_equal(
-                    "is_block == True",
-                    meta.query_advice(block_gadget.is_block, Rotation::cur()),
-                    1.expr(),
-                );
-
-                cb.gate(and::expr([
-                    meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
-                    is_zb_rle_block(meta),
-                ]))
-            },
-        );
 
         debug_assert!(meta.degree() <= 9);
 
