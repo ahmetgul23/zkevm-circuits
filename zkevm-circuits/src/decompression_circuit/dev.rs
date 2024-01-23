@@ -51,7 +51,7 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
                 challenges: challenge_exprs,
                 literals_header_table,
                 u8_table,
-                range_table_0x08: range8,
+                range8,
                 pow2_table,
                 keccak_table,
             },

@@ -1959,32 +1959,21 @@ impl LiteralsHeaderTable {
             vec![(condition * range_value, range16.into())]
         });
         meta.lookup("LiteralsHeaderTable: byte1 >> 6", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(table.q_enable, Rotation::cur()),
-                not::expr(branch0(meta)),
-            ]);
+            let condition = meta.query_fixed(table.q_enable, Rotation::cur());
             let range_value = meta.query_advice(table.byte1, Rotation::cur())
                 - (meta.query_advice(table.byte1_rs_6, Rotation::cur()) * 64.expr());
 
             vec![(condition * range_value, range64.into())]
         });
         meta.lookup("LiteralsHeaderTable: byte2 >> 2", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(table.q_enable, Rotation::cur()),
-                not::expr(branch0(meta)),
-                not::expr(branch1(meta)),
-            ]);
+            let condition = meta.query_fixed(table.q_enable, Rotation::cur());
             let range_value = meta.query_advice(table.byte2, Rotation::cur())
                 - (meta.query_advice(table.byte2_rs_2, Rotation::cur()) * 4.expr());
 
             vec![(condition * range_value, range4.into())]
         });
         meta.lookup("LiteralsHeaderTable: byte2 >> 6", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(table.q_enable, Rotation::cur()),
-                not::expr(branch0(meta)),
-                not::expr(branch1(meta)),
-            ]);
+            let condition = meta.query_fixed(table.q_enable, Rotation::cur());
             let range_value = meta.query_advice(table.byte2, Rotation::cur())
                 - (meta.query_advice(table.byte2_rs_6, Rotation::cur()) * 64.expr());
 
@@ -2007,11 +1996,7 @@ impl LiteralsHeaderTable {
             .collect::<Vec<_>>()
         });
         meta.lookup_any("LiteralsHeaderTable: byte2 & 3", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(table.q_enable, Rotation::cur()),
-                not::expr(branch0(meta)),
-                not::expr(branch1(meta)),
-            ]);
+            let condition = meta.query_fixed(table.q_enable, Rotation::cur());
             [
                 BitwiseOp::AND.expr(),
                 meta.query_advice(table.byte2, Rotation::cur()),
@@ -2024,11 +2009,7 @@ impl LiteralsHeaderTable {
             .collect::<Vec<_>>()
         });
         meta.lookup_any("LiteralsHeaderTable: byte2 & 63", |meta| {
-            let condition = and::expr([
-                meta.query_fixed(table.q_enable, Rotation::cur()),
-                not::expr(branch0(meta)),
-                not::expr(branch1(meta)),
-            ]);
+            let condition = meta.query_fixed(table.q_enable, Rotation::cur());
             [
                 BitwiseOp::AND.expr(),
                 meta.query_advice(table.byte2, Rotation::cur()),
@@ -2040,6 +2021,8 @@ impl LiteralsHeaderTable {
             .map(|(input, table)| (input * condition.clone(), table))
             .collect::<Vec<_>>()
         });
+
+        debug_assert!(meta.degree() <= 9);
 
         table
     }
@@ -2304,6 +2287,8 @@ pub struct LiteralsHeaderRomTable {
     /// - block_type == Compressed and size_format == 10
     /// - block_type == Compressed and size_format == 11
     branch: Column<Fixed>,
+    // size format == 0b11?
+    is_size_format_0b11: Column<Fixed>,
 }
 
 impl<F: Field> LookupTable<F> for LiteralsHeaderRomTable {
@@ -2316,6 +2301,7 @@ impl<F: Field> LookupTable<F> for LiteralsHeaderRomTable {
             self.n_bytes_header.into(),
             self.n_lstreams.into(),
             self.branch.into(),
+            self.is_size_format_0b11.into(),
         ]
     }
 
@@ -2328,6 +2314,7 @@ impl<F: Field> LookupTable<F> for LiteralsHeaderRomTable {
             String::from("n_bytes_header"),
             String::from("n_lstreams"),
             String::from("branch"),
+            String::from("is_size_format_0b11"),
         ]
     }
 }
@@ -2343,6 +2330,7 @@ impl LiteralsHeaderRomTable {
             n_bytes_header: meta.fixed_column(),
             n_lstreams: meta.fixed_column(),
             branch: meta.fixed_column(),
+            is_size_format_0b11: meta.fixed_column(),
         }
     }
 
@@ -2353,18 +2341,18 @@ impl LiteralsHeaderRomTable {
             |mut region| {
                 // Refer: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#literals_section_header
                 for (i, row) in [
-                    [0, 0, 0, 0, 1, 1, 0], // Raw: 1 byte header
-                    [0, 0, 0, 1, 1, 1, 0], // Raw: 1 byte header
-                    [0, 0, 1, 0, 2, 1, 1], // Raw: 2 bytes header
-                    [0, 0, 1, 1, 3, 1, 2], // Raw: 3 bytes header
-                    [1, 0, 0, 0, 1, 1, 0], // RLE: 1 byte header
-                    [1, 0, 0, 1, 1, 1, 0], // RLE: 1 byte header
-                    [1, 0, 1, 0, 2, 1, 1], // RLE: 2 bytes header
-                    [1, 0, 1, 1, 3, 1, 2], // RLE: 3 bytes header
-                    [0, 1, 0, 0, 3, 1, 3], // Compressed: 3 bytes header
-                    [0, 1, 1, 0, 3, 4, 4], // Compressed: 3 bytes header
-                    [0, 1, 0, 1, 4, 4, 5], // Compressed: 4 bytes header
-                    [0, 1, 1, 1, 5, 4, 6], // Compressed: 5 bytes header
+                    [0, 0, 0, 0, 1, 1, 0, 0], // Raw: 1 byte header
+                    [0, 0, 0, 1, 1, 1, 0, 0], // Raw: 1 byte header
+                    [0, 0, 1, 0, 2, 1, 1, 0], // Raw: 2 bytes header
+                    [0, 0, 1, 1, 3, 1, 2, 1], // Raw: 3 bytes header
+                    [1, 0, 0, 0, 1, 1, 0, 0], // RLE: 1 byte header
+                    [1, 0, 0, 1, 1, 1, 0, 0], // RLE: 1 byte header
+                    [1, 0, 1, 0, 2, 1, 1, 0], // RLE: 2 bytes header
+                    [1, 0, 1, 1, 3, 1, 2, 1], // RLE: 3 bytes header
+                    [0, 1, 0, 0, 3, 1, 3, 0], // Compressed: 3 bytes header
+                    [0, 1, 1, 0, 3, 4, 4, 0], // Compressed: 3 bytes header
+                    [0, 1, 0, 1, 4, 4, 5, 0], // Compressed: 4 bytes header
+                    [0, 1, 1, 1, 5, 4, 6, 1], // Compressed: 5 bytes header
                 ]
                 .iter()
                 .enumerate()
