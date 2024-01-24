@@ -176,6 +176,8 @@ pub enum ZstdTag {
     ZstdBlockLiteralsRawBytes,
     /// Zstd blocks might contain rle bytes.
     ZstdBlockLiteralsRleBytes,
+    /// Zstd block's huffman header and FSE code.
+    ZstdBlockFseCode,
     /// Zstd block's huffman code.
     ZstdBlockHuffmanCode,
     /// Zstd block's jump table.
@@ -206,6 +208,7 @@ impl ToString for ZstdTag {
             Self::ZstdBlockLiteralsHeader => "ZstdBlockLiteralsHeader",
             Self::ZstdBlockLiteralsRawBytes => "ZstdBlockLiteralsRawBytes",
             Self::ZstdBlockLiteralsRleBytes => "ZstdBlockLiteralsRleBytes",
+            Self::ZstdBlockFseCode => "ZstdBlockFseCode",
             Self::ZstdBlockHuffmanCode => "ZstdBlockHuffmanCode",
             Self::ZstdBlockJumpTable => "ZstdBlockJumpTable",
             Self::ZstdBlockLstream => "ZstdBlockLstream",
