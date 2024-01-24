@@ -30,9 +30,9 @@ impl TagRomTableRow {
     pub(crate) fn rows() -> Vec<Self> {
         use ZstdTag::{
             BlockHeader, FrameContentSize, FrameHeaderDescriptor, Null, RawBlockBytes,
-            RleBlockBytes, ZstdBlockHuffmanCode, ZstdBlockJumpTable, ZstdBlockLiteralsHeader,
-            ZstdBlockLiteralsRawBytes, ZstdBlockLiteralsRleBytes, ZstdBlockLstream,
-            ZstdBlockSequenceHeader,
+            RleBlockBytes, ZstdBlockFseCode, ZstdBlockHuffmanCode, ZstdBlockJumpTable,
+            ZstdBlockLiteralsHeader, ZstdBlockLiteralsRawBytes, ZstdBlockLiteralsRleBytes,
+            ZstdBlockLstream, ZstdBlockSequenceHeader,
         };
 
         [
@@ -59,7 +59,8 @@ impl TagRomTableRow {
                 1048575,
                 true,
             ),
-            (ZstdBlockLiteralsHeader, ZstdBlockHuffmanCode, 5, false),
+            (ZstdBlockLiteralsHeader, ZstdBlockFseCode, 5, false),
+            (ZstdBlockFseCode, ZstdBlockHuffmanCode, 128, false),
             (ZstdBlockHuffmanCode, ZstdBlockJumpTable, 128, false), // header_byte < 128
             (ZstdBlockHuffmanCode, ZstdBlockLstream, 128, false),
             (ZstdBlockJumpTable, ZstdBlockLstream, 6, false),

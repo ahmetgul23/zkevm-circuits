@@ -2035,10 +2035,10 @@ impl LiteralsHeaderTable {
     ) -> Result<(), Error> {
         layouter.assign_region(
             || "LiteralsHeaderTable",
-            |mut region| {
-                for (i, header) in literals_headers.iter().enumerate() {
-                    let n_bytes_header = header.len();
-                    // TODO
+            |_region| {
+                for (_i, header) in literals_headers.iter().enumerate() {
+                    let _n_bytes_header = header.len();
+                    // TODO: make the appropriate assignment.
                 }
                 Ok(())
             },
@@ -2127,10 +2127,7 @@ impl TagRomTable {
         layouter.assign_region(
             || "Zstd ROM table",
             |mut region| {
-                // TODO: populate these rows.
-                let rows: Vec<TagRomTableRow> = Vec::new();
-
-                for (offset, row) in rows.iter().enumerate() {
+                for (offset, row) in TagRomTableRow::rows().iter().enumerate() {
                     for (&column, (value, annotation)) in
                         <Self as LookupTable<F>>::fixed_columns(self).iter().zip(
                             row.values::<F>()

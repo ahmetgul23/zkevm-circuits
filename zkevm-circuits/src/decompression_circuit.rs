@@ -30,7 +30,7 @@ use crate::{
         decompression::{
             BlockTypeRomTable, LiteralsHeaderRomTable, LiteralsHeaderTable, TagRomTable,
         },
-        KeccakTable, LookupTable, Pow2Table, RangeTable, U8Table,
+        KeccakTable, LookupTable, Pow2Table, RangeTable,
     },
     util::{Challenges, SubCircuit, SubCircuitConfig},
     witness::{Block, ZstdTag, N_BITS_PER_BYTE, N_BITS_ZSTD_TAG, N_BLOCK_HEADER_BYTES},
@@ -42,10 +42,12 @@ pub struct DecompressionCircuitConfigArgs<F> {
     pub challenges: Challenges<Expression<F>>,
     /// Lookup table to get regenerated and compressed size from LiteralsHeader.
     pub literals_header_table: LiteralsHeaderTable,
-    /// U8 table, i.e. RangeTable for [0, 1 << 8).
-    pub u8_table: U8Table,
     /// RangeTable for [0, 8).
     pub range8: RangeTable<8>,
+    /// RangeTable for [0; 128).
+    pub range128: RangeTable<128>,
+    /// U8 table, i.e. RangeTable for [0, 1 << 8).
+    pub range256: RangeTable<256>,
     /// Power of 2 table.
     pub pow2_table: Pow2Table,
     /// Table from the Keccak circuit.
@@ -98,9 +100,6 @@ pub struct DecompressionCircuitConfig<F> {
     reverse_chunk: ReverseChunk,
     /// Auxiliary columns, multi-purpose depending on the current tag.
     aux_fields: AuxFields,
-
-    /// The range table to check value is byte.
-    u8_table: U8Table,
 }
 
 /// Block level details are specified in these columns.
@@ -152,6 +151,8 @@ pub struct TagGadget<F> {
     is_block_header: Column<Advice>,
     /// Helper column to reduce the circuit degree. Set when tag == LiteralsHeader.
     is_literals_header: Column<Advice>,
+    /// Helper column to reduce the circuit degree. Set when tag == FseCode.
+    is_fse_code: Column<Advice>,
 }
 
 /// Columns related to processing little-endian chunk of bytes.
@@ -223,8 +224,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         Self::ConfigArgs {
             challenges,
             literals_header_table,
-            u8_table,
             range8,
+            range128,
+            range256,
             pow2_table,
             keccak_table: _,
         }: Self::ConfigArgs,
@@ -261,7 +263,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
                     |meta| meta.query_advice(block_idx, Rotation::cur()),
                     |meta| meta.query_advice(block_len, Rotation::cur()),
-                    u8_table.into(),
+                    range256.into(),
                 ),
             }
         };
@@ -285,7 +287,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
                     |meta| meta.query_advice(max_len, Rotation::cur()),
                     |_meta| 0x20.expr(),
-                    u8_table.into(),
+                    range256.into(),
                 ),
                 is_tag_change: meta.advice_column(),
                 idx_cmp_len: ComparatorChip::configure(
@@ -293,17 +295,18 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
                     |meta| meta.query_advice(tag_idx, Rotation::cur()),
                     |meta| meta.query_advice(tag_len, Rotation::cur()),
-                    u8_table.into(),
+                    range256.into(),
                 ),
                 len_cmp_max: ComparatorChip::configure(
                     meta,
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
                     |meta| meta.query_advice(tag_len, Rotation::cur()),
                     |meta| meta.query_advice(max_len, Rotation::cur()),
-                    u8_table.into(),
+                    range256.into(),
                 ),
                 is_block_header: meta.advice_column(),
                 is_literals_header: meta.advice_column(),
+                is_fse_code: meta.advice_column(),
             }
         };
         let reverse_chunk = ReverseChunk {
@@ -332,7 +335,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             };
         }
 
-        is_tag!(is_null, Null);
+        is_tag!(_is_null, Null);
         is_tag!(is_frame_header_descriptor, FrameHeaderDescriptor);
         is_tag!(is_frame_content_size, FrameContentSize);
         is_tag!(is_block_header, BlockHeader);
@@ -345,7 +348,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
         is_tag!(is_zb_huffman_code, ZstdBlockHuffmanCode);
         is_tag!(is_zb_jump_table, ZstdBlockJumpTable);
         is_tag!(is_zb_lstream, ZstdBlockLstream);
-        is_tag!(is_zb_sequence_header, ZstdBlockSequenceHeader);
+        is_tag!(_is_zb_sequence_header, ZstdBlockSequenceHeader);
 
         let constrain_value_rlc =
             |meta: &mut VirtualCells<F>, cb: &mut BaseConstraintBuilder<F>, is_reverse: bool| {
@@ -420,6 +423,12 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 "degree reduction: is_literals_header check",
                 is_zb_literals_header(meta),
                 meta.query_advice(tag_gadget.is_literals_header, Rotation::cur()),
+            );
+
+            cb.require_equal(
+                "degree reduction: is_fse_code check",
+                is_zb_fse_code(meta),
+                meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
             );
 
             cb.gate(meta.query_fixed(q_enable, Rotation::cur()))
@@ -619,7 +628,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
 
                 vec![(
                     condition * meta.query_advice(decoded_byte, Rotation::cur()),
-                    u8_table.into(),
+                    range256.into(),
                 )]
             },
         );
@@ -1592,13 +1601,40 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
                 );
 
+                // The huffman header is a single byte, which we have included as a part of the
+                // FSE code tag. We expect value_byte < 128 because the huffman code is encoded
+                // using an FSE code. The value of this byte is actually the number of bytes taken
+                // to represent the huffman data.
+                //
+                // In our case, this means the tag length of FSE code and the tag length of Huffman
+                // code together should equate to the value of this byte.
+                //
+                // Note: tag_len + tag_len::tag_next + 1 == value_byte. The added 1 includes this
+                // byte (huffman header) itself.
+                let tag_len_fse_code = meta.query_advice(tag_gadget.tag_len, Rotation::cur());
+                let tag_len_huffman_code = meta.query_advice(aux_fields.aux1, Rotation::cur());
+                cb.require_equal(
+                    "huffman header value byte check",
+                    meta.query_advice(value_byte, Rotation::cur()) + 1.expr(),
+                    tag_len_fse_code + tag_len_huffman_code,
+                );
+
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
-                    is_zb_fse_code(meta),
+                    meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
                 ]))
             },
         );
+        meta.lookup("DecompressionCircuit: huffman header byte value", |meta| {
+            let condition = and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
+            ]);
+            let range_value = meta.query_advice(value_byte, Rotation::cur());
+            vec![(condition * range_value, range128.into())]
+        });
         meta.create_gate(
             "DecompressionCircuit: ZstdBlockFseCode (fse code)",
             |meta| {
@@ -1615,10 +1651,19 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
                 );
 
+                // The auxiliary field aux1 is used to mark the tag length of the next tag
+                // (ZstdBlockHuffmanCode). We want to make sure it remains the same throughout this
+                // tag.
+                cb.require_equal(
+                    "aux field aux1 (tag_len::tag_next) remains the same",
+                    meta.query_advice(aux_fields.aux1, Rotation::cur()),
+                    meta.query_advice(aux_fields.aux1, Rotation::prev()),
+                );
+
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
-                    is_zb_fse_code(meta),
+                    meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
                 ]))
             },
         );
@@ -1643,6 +1688,19 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     "is_reverse == True",
                     meta.query_advice(reverse_chunk.is_reverse, Rotation::cur()),
                     1.expr(),
+                );
+
+                // Check that the aux1 field was assigned correctly for the FseCode tag. This field
+                // should equal the tag length of the HuffmanCode tag.
+                cb.condition(
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+                    |cb| {
+                        cb.require_equal(
+                            "aux field aux1 is the tag_len of the next tag",
+                            meta.query_advice(aux_fields.aux1, Rotation::prev()),
+                            meta.query_advice(tag_gadget.tag_len, Rotation::cur()),
+                        );
+                    },
                 );
 
                 cb.gate(and::expr([
@@ -1722,7 +1780,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             tag_gadget,
             reverse_chunk,
             aux_fields,
-            u8_table,
         }
     }
 }

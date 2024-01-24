@@ -10,7 +10,6 @@ use crate::{
     },
     table::{
         decompression::LiteralsHeaderTable, BitwiseOpTable, KeccakTable, Pow2Table, RangeTable,
-        U8Table,
     },
     util::{Challenges, SubCircuit, SubCircuitConfig},
 };
@@ -28,12 +27,13 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
     fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
         let challenges = Challenges::construct(meta);
         let challenge_exprs = challenges.exprs(meta);
-        let u8_table = U8Table::construct(meta);
         let bitwise_op_table = BitwiseOpTable::construct(meta);
         let range4 = RangeTable::construct(meta);
         let range8 = RangeTable::construct(meta);
         let range16 = RangeTable::construct(meta);
         let range64 = RangeTable::construct(meta);
+        let range128 = RangeTable::construct(meta);
+        let range256 = RangeTable::construct(meta);
         let pow2_table = Pow2Table::construct(meta);
         let keccak_table = KeccakTable::construct(meta);
         let literals_header_table = LiteralsHeaderTable::construct(
@@ -50,8 +50,9 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
             DecompressionCircuitConfigArgs {
                 challenges: challenge_exprs,
                 literals_header_table,
-                u8_table,
                 range8,
+                range128,
+                range256,
                 pow2_table,
                 keccak_table,
             },
@@ -67,7 +68,6 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let challenges = &config.1.values(&layouter);
-        config.0.u8_table.load(&mut layouter)?;
         self.synthesize_sub(&config.0, challenges, &mut layouter)
     }
 }
