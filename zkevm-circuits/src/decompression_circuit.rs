@@ -595,6 +595,14 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             |meta| {
                 let mut cb = BaseConstraintBuilder::default();
 
+                // TODO: There can be scenarios when ``is_output`` is set, but there may be no
+                // decoded byte on that row.
+                //
+                // One such scenario is: If the first byte in the ZstdBlockLstream tag is
+                // 0b00000001, i.e. 7 leading 0s followed by the sentinel 1 bit. Even though we
+                // expect ``is_output`` to be set for the ZstdBlockLstream tag, this row itself
+                // wouldn't output any decoded byte.
+
                 cb.require_equal(
                     "decoded length accumulator increments",
                     meta.query_advice(decoded_len_acc, Rotation::cur()),
