@@ -1697,6 +1697,16 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     "first symbol that is decoded in FSE is S0, i.e. 0",
                     meta.query_advice(bitstream_decoder.decoded_symbol, Rotation::next()),
                 );
+                // We use the aux5 column as an accumulator for the number of times each symbol
+                // appears. At the end of decoding the accumulator should match the table size.
+                //
+                // The number of times a symbol appears is R - 1, where R is the binary value read
+                // from the bitstring.
+                cb.require_equal(
+                    "symbol count accumulator",
+                    meta.query_advice(aux_fields.aux5, Rotation::next()) + 1.expr(),
+                    meta.query_advice(bitstream_decoder.bit_value, Rotation::next()),
+                );
 
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
@@ -1777,12 +1787,25 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 // we've already done the check for the first symbol in the huffman header gate, we
                 // only check for increments.
                 let is_last = meta.query_advice(tag_gadget.is_tag_change, Rotation::next());
-                cb.condition(not::expr(is_last), |cb| {
+                cb.condition(not::expr(is_last.expr()), |cb| {
                     cb.require_equal(
                         "fse table reconstruction: decoded symbol increments",
                         meta.query_advice(bitstream_decoder.decoded_symbol, Rotation::cur())
                             + 1.expr(),
                         meta.query_advice(bitstream_decoder.decoded_symbol, Rotation::next()),
+                    );
+                    cb.require_equal(
+                        "number of times a symbol appears is accumulated correctly",
+                        meta.query_advice(aux_fields.aux5, Rotation::next()) + 1.expr(),
+                        meta.query_advice(aux_fields.aux5, Rotation::cur())
+                            + meta.query_advice(bitstream_decoder.bit_value, Rotation::next()),
+                    );
+                });
+                cb.condition(is_last, |cb| {
+                    cb.require_equal(
+                        "on the last row, accumulated number of symbols is the table size of FSE table",
+                        meta.query_advice(aux_fields.aux5, Rotation::cur()),
+                        meta.query_advice(aux_fields.aux2, Rotation::cur()),
                     );
                 });
 
