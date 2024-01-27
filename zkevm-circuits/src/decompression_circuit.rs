@@ -1786,6 +1786,28 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     );
                 });
 
+                // The next bitstring to be decoded should start right after the current bitstring
+                // ends, i.e. bit_index_start' == bit_index_end + 1.
+                //
+                // However, we have 0 <= bit_index_end < 16. So we want to check:
+                // - bit_index_start' == (bit_index_end % 8) + 1.
+                let bit_index_end =
+                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur());
+                let bit_index_end_mod8 = select::expr(
+                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
+                    bit_index_end.expr(),
+                    bit_index_end - 8.expr(),
+                );
+                cb.require_equal(
+                    "start of next bitstring is right after the end of the current",
+                    meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
+                    bit_index_end_mod8 + 1.expr(),
+                );
+
+                // The check that bit_index_end >= bit_index_start is indirectly verified through
+                // the lookup to the HuffmanCodesBitstringAccumulationTable, since the bit_index in
+                // that table is a fixed column.
+
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
