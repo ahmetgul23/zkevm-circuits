@@ -684,6 +684,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(tag_gadget.tag_next, Rotation::cur()),
                     meta.query_advice(tag_gadget.max_len, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_output, Rotation::cur()),
+                    meta.query_advice(block_gadget.is_block, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_reverse, Rotation::cur()),
                 ]
                 .into_iter()
                 .zip(tag_rom_table.table_exprs(meta))
