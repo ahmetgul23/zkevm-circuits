@@ -28,7 +28,7 @@ use crate::{
     evm_circuit::util::constraint_builder::{BaseConstraintBuilder, ConstrainBuilderCommon},
     table::{
         decompression::{
-            BlockTypeRomTable, FseAuxiliaryTable, HuffmanCodesBitstringAccumulationTable,
+            BitstringAccumulationTable, BlockTypeRomTable, FseAuxiliaryTable,
             LiteralsHeaderRomTable, LiteralsHeaderTable, TagRomTable,
         },
         KeccakTable, LookupTable, Pow2Table, PowOfRandTable, RangeTable,
@@ -44,7 +44,7 @@ pub struct DecompressionCircuitConfigArgs<F> {
     /// Lookup table for FSE table by symbol.
     pub fse_aux_table: FseAuxiliaryTable<F>,
     /// Lookup table to validate bitstring values within or spanned over bytes.
-    pub bs_acc_table: HuffmanCodesBitstringAccumulationTable,
+    pub bs_acc_table: BitstringAccumulationTable,
     /// Lookup table to get regenerated and compressed size from LiteralsHeader.
     pub literals_header_table: LiteralsHeaderTable,
     /// RangeTable for [0, 8).
