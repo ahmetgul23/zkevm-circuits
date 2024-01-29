@@ -8,7 +8,7 @@ use gadgets::{
     comparator::{ComparatorChip, ComparatorConfig, ComparatorInstruction},
     impl_expr,
     is_equal::{IsEqualChip, IsEqualConfig},
-    util::{and, not, Expr},
+    util::{and, not, select, Expr},
 };
 use halo2_proofs::{
     circuit::{Layouter, Value},
@@ -1387,6 +1387,9 @@ pub struct BitstringAccumulationTable {
     pub from_start: Column<Advice>,
     /// Boolean that is set from bit_index == 0 to end of bit chunk.
     pub until_end: Column<Advice>,
+    /// Boolean to mark if the bitstring is a part of bytes that are read from front-to-back or
+    /// back-to-front. For the back-to-front case, the is_reverse boolean is set.
+    pub is_reverse: Column<Advice>,
 }
 
 impl BitstringAccumulationTable {
@@ -1408,6 +1411,7 @@ impl BitstringAccumulationTable {
             bit_value_acc: meta.advice_column(),
             from_start: meta.advice_column(),
             until_end: meta.advice_column(),
+            is_reverse: meta.advice_column(),
         };
 
         meta.create_gate("BitstringAccumulationTable: bit_index == 0", |meta| {
@@ -1420,27 +1424,60 @@ impl BitstringAccumulationTable {
             cb.require_equal(
                 "byte1 is the binary accumulation of 0 <= bit_index <= 7",
                 meta.query_advice(table.byte_1, Rotation::cur()),
-                bits[0].expr()
-                    + bits[1].expr() * 2.expr()
-                    + bits[2].expr() * 4.expr()
-                    + bits[3].expr() * 8.expr()
-                    + bits[4].expr() * 16.expr()
-                    + bits[5].expr() * 32.expr()
-                    + bits[6].expr() * 64.expr()
-                    + bits[7].expr() * 128.expr(),
+                select::expr(
+                    meta.query_advice(table.is_reverse, Rotation::cur()),
+                    bits[7].expr()
+                        + bits[6].expr() * 2.expr()
+                        + bits[5].expr() * 4.expr()
+                        + bits[4].expr() * 8.expr()
+                        + bits[3].expr() * 16.expr()
+                        + bits[2].expr() * 32.expr()
+                        + bits[1].expr() * 64.expr()
+                        + bits[0].expr() * 128.expr(),
+                    bits[0].expr()
+                        + bits[1].expr() * 2.expr()
+                        + bits[2].expr() * 4.expr()
+                        + bits[3].expr() * 8.expr()
+                        + bits[4].expr() * 16.expr()
+                        + bits[5].expr() * 32.expr()
+                        + bits[6].expr() * 64.expr()
+                        + bits[7].expr() * 128.expr(),
+                ),
             );
 
             cb.require_equal(
                 "byte2 is the binary accumulation of 8 <= bit_index <= 15",
                 meta.query_advice(table.byte_2, Rotation::cur()),
-                bits[8].expr()
-                    + bits[9].expr() * 2.expr()
-                    + bits[10].expr() * 4.expr()
-                    + bits[11].expr() * 8.expr()
-                    + bits[12].expr() * 16.expr()
-                    + bits[13].expr() * 32.expr()
-                    + bits[14].expr() * 64.expr()
-                    + bits[15].expr() * 128.expr(),
+                select::expr(
+                    meta.query_advice(table.is_reverse, Rotation::cur()),
+                    bits[15].expr()
+                        + bits[14].expr() * 2.expr()
+                        + bits[13].expr() * 4.expr()
+                        + bits[12].expr() * 8.expr()
+                        + bits[11].expr() * 16.expr()
+                        + bits[10].expr() * 32.expr()
+                        + bits[9].expr() * 64.expr()
+                        + bits[8].expr() * 128.expr(),
+                    bits[8].expr()
+                        + bits[9].expr() * 2.expr()
+                        + bits[10].expr() * 4.expr()
+                        + bits[11].expr() * 8.expr()
+                        + bits[12].expr() * 16.expr()
+                        + bits[13].expr() * 32.expr()
+                        + bits[14].expr() * 64.expr()
+                        + bits[15].expr() * 128.expr(),
+                ),
+            );
+
+            cb.require_equal(
+                "byte2 follows byte2, i.e. byte_idx_2 == byte_idx_1 + 1",
+                meta.query_advice(table.byte_idx_2, Rotation::cur()),
+                meta.query_advice(table.byte_idx_1, Rotation::cur()) + 1.expr(),
+            );
+
+            cb.require_boolean(
+                "is_reverse is boolean",
+                meta.query_advice(table.is_reverse, Rotation::cur()),
             );
 
             cb.gate(and::expr([
@@ -1462,6 +1499,7 @@ impl BitstringAccumulationTable {
                 table.byte_1,
                 table.byte_2,
                 table.bit_value,
+                table.is_reverse,
             ] {
                 cb.require_equal(
                     "unchanged columns from 0 < bit_idx < 16",
@@ -1616,6 +1654,8 @@ impl BitstringAccumulationTable {
 
     /// Load witness to the table: dev mode.
     pub fn dev_load<F: Field>(&self, _layouter: &mut impl Layouter<F>) -> Result<(), Error> {
+        // TODO
+
         Ok(())
     }
 }
@@ -1636,6 +1676,7 @@ impl BitstringAccumulationTable {
             meta.query_fixed(self.bit_index, Rotation::cur()),
             meta.query_advice(self.from_start, Rotation::cur()),
             meta.query_advice(self.until_end, Rotation::cur()),
+            meta.query_advice(self.is_reverse, Rotation::cur()),
         ]
     }
 
@@ -1653,6 +1694,7 @@ impl BitstringAccumulationTable {
             meta.query_fixed(self.bit_index, Rotation::cur()),
             meta.query_advice(self.from_start, Rotation::cur()),
             meta.query_advice(self.until_end, Rotation::cur()),
+            meta.query_advice(self.is_reverse, Rotation::cur()),
         ]
     }
 }

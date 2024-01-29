@@ -4,6 +4,9 @@ pub const N_BITS_PER_BYTE: usize = 8;
 /// Number of bytes used to specify block header.
 pub const N_BLOCK_HEADER_BYTES: usize = 3;
 
+/// Number of bytes used in the Jump table.
+pub const N_JUMP_TABLE_BYTES: usize = 6;
+
 /// Maximum number of symbols (weights), i.e. symbol in [0, N_MAX_SYMBOLS).
 pub const N_MAX_SYMBOLS: usize = 8;
 
