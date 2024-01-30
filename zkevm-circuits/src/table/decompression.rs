@@ -548,6 +548,8 @@ pub struct HuffmanCodesTable<F> {
     pub q_enabled: Column<Fixed>,
     /// Fixed column to mark the first row in the table.
     pub q_first: Column<Fixed>,
+    /// Set when this is the start of a new huffman code.
+    pub is_start: Column<Advice>,
     /// The byte offset within the data instance where the encoded FSE table begins. This is
     /// 1-indexed, i.e. byte_offset == 1 at the first byte.
     pub byte_offset: Column<Advice>,
@@ -599,6 +601,7 @@ impl<F: Field> HuffmanCodesTable<F> {
                 |meta| meta.query_advice(byte_offset, Rotation::next()),
                 u8_table.into(),
             ),
+            is_start: meta.advice_column(),
             symbol: meta.advice_column(),
             weight,
             weight_bits: BinaryNumberChip::configure(meta, q_enabled, Some(weight.into())),
@@ -610,6 +613,8 @@ impl<F: Field> HuffmanCodesTable<F> {
             last_bit_values: array_init(|_| meta.advice_column()),
             first_lbvs: array_init(|_| meta.advice_column()),
         };
+
+        // TODO: constrain is_start
 
         // All rows
         meta.create_gate("HuffmanCodesTable: all rows", |meta| {
@@ -739,8 +744,8 @@ impl<F: Field> HuffmanCodesTable<F> {
 
                 // For all rows (except the first row of a canonical Huffman code representation, we
                 // want to ensure the last_bit_values was assigned correctly.
-                let (_gt, is_not_first) = table.byte_offset_cmp.expr(meta, Some(Rotation::prev()));
-                cb.condition(is_not_first, |cb| {
+                let is_start = meta.query_advice(table.is_start, Rotation::cur());
+                cb.condition(not::expr(is_start.expr()), |cb| {
                     for (symbol, &last_bit_value) in
                         FseSymbol::iter().zip(table.last_bit_values.iter())
                     {
@@ -808,7 +813,14 @@ impl<F: Field> HuffmanCodesTable<F> {
             // i.e. lbv_2 * 2 - lbv_1 is boolean.
             //
             // Note: we only do this check for weight > 0, hence we skip the FseSymbol::S0.
-            for i in FseSymbol::iter().skip(1) {
+            for i in [
+                FseSymbol::S1,
+                FseSymbol::S2,
+                FseSymbol::S3,
+                FseSymbol::S4,
+                FseSymbol::S5,
+                FseSymbol::S6,
+            ] {
                 let i = i as usize;
                 let lbv_1 = meta.query_advice(table.first_lbvs[i], Rotation::cur());
                 let lbv_2 = meta.query_advice(table.last_bit_values[i + 1], Rotation::cur());
@@ -853,6 +865,13 @@ impl<F: Field> HuffmanCodesTable<F> {
         // TODO: add the padding column.
         meta.create_gate("HuffmanCodesTable: new huffman code", |meta| {
             let mut cb = BaseConstraintBuilder::default();
+
+            // Marks the start of a new huffman code.
+            cb.require_equal(
+                "is_start == 1",
+                meta.query_advice(table.is_start, Rotation::next()),
+                1.expr(),
+            );
 
             // Canonical Huffman code starts with the weight of the first symbol, i.e. 0x00.
             cb.require_equal(

@@ -9,7 +9,9 @@ use crate::{
         DecompressionCircuit, DecompressionCircuitConfig, DecompressionCircuitConfigArgs,
     },
     table::{
-        decompression::{BitstringAccumulationTable, FseTable, LiteralsHeaderTable},
+        decompression::{
+            BitstringAccumulationTable, FseTable, HuffmanCodesTable, LiteralsHeaderTable,
+        },
         BitwiseOpTable, KeccakTable, Pow2Table, PowOfRandTable, RangeTable,
     },
     util::{Challenges, SubCircuit, SubCircuitConfig},
@@ -39,6 +41,7 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
         let keccak_table = KeccakTable::construct(meta);
         let pow_rand_table = PowOfRandTable::construct(meta, &challenge_exprs);
         let fse_table = FseTable::construct(meta, bitwise_op_table, pow2_table, range8, range256);
+        let huffman_codes_table = HuffmanCodesTable::construct(meta, pow2_table, range256);
         let bs_acc_table = BitstringAccumulationTable::construct(meta);
         let literals_header_table = LiteralsHeaderTable::construct(
             meta,
@@ -54,6 +57,7 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
             DecompressionCircuitConfigArgs {
                 challenges: challenge_exprs,
                 fse_table,
+                huffman_codes_table,
                 bs_acc_table,
                 literals_header_table,
                 range8,
