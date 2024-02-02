@@ -39,7 +39,7 @@ pub use tx::Transaction;
 
 mod zstd;
 pub use zstd::{
-    FseAuxiliaryTableData, FseSymbol, FseTableData, FseTableRow, HuffmanCodesData, TagRomTableRow,
-    ZstdTag, N_BITS_PER_BYTE, N_BITS_SYMBOL, N_BITS_ZSTD_TAG, N_BLOCK_HEADER_BYTES,
+    FseAuxiliaryTableData, FseSymbol, FseTableData, FseTableRow, HuffmanCodesData, LstreamNum,
+    TagRomTableRow, ZstdTag, N_BITS_PER_BYTE, N_BITS_SYMBOL, N_BITS_ZSTD_TAG, N_BLOCK_HEADER_BYTES,
     N_JUMP_TABLE_BYTES, N_MAX_SYMBOLS,
 };
