@@ -284,24 +284,14 @@ impl<F: Field> BitstreamDecoder<F> {
 /// Fields related to application of the FSE table.
 #[derive(Clone, Debug)]
 pub struct FseDecoder {
-    /// Boolean that is set if a symbol is emitted on this row. When we apply an FSE table to an
-    /// incoming bitstream, we skip the first leading 0s and a sentinel bits. This can be 8 bits as
-    /// well, meaning that an entire byte is skipped. After skipping these bits, we read AL number
-    /// of bits to know our the first state to start from.
-    ///
-    /// The ``is_emit`` column can never be set on the first row of the HuffmanCode tag, as the
-    /// first row is either:
-    /// - 7 leading 0s and a sentinel bit OR
-    /// - leading 0s, sentinel and reading AL bits to find the first state.
-    is_emit: Column<Advice>,
-    /// Number of symbols we have emitted.
-    num_emitted: Column<Advice>,
     /// The FSE state we are at.
     state: Column<Advice>,
     /// The baseline value at ``state``.
     baseline: Column<Advice>,
     /// The symbol emitted while transitioning from ``state`` to a new state.
     symbol: Column<Advice>,
+    /// Number of symbols we have emitted.
+    num_emitted: Column<Advice>,
     /// An accumulator that keeps a count of the number of states assigned for each symbol,
     /// including the symbol that is decoded on the current row.
     n_acc: Column<Advice>,
@@ -486,11 +476,10 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             }
         };
         let fse_decoder = FseDecoder {
-            is_emit: meta.advice_column(),
-            num_emitted: meta.advice_column(),
             state: meta.advice_column(),
             baseline: meta.advice_column(),
             symbol: meta.advice_column(),
+            num_emitted: meta.advice_column(),
             n_acc: meta.advice_column(),
         };
         let lstream = meta.advice_column();
@@ -2008,19 +1997,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 // - Only from the third row onwards, do we start emitting symbols (weights).
 
                 cb.require_zero(
-                    "is_emit == false on the first row",
-                    meta.query_advice(fse_decoder.is_emit, Rotation::cur()),
-                );
-                cb.require_zero(
-                    "is_emit == false on the second row",
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
-                );
-                cb.require_equal(
-                    "is_emit == true from the third row onwards",
-                    meta.query_advice(fse_decoder.is_emit, Rotation(2)),
-                    1.expr(),
-                );
-                cb.require_zero(
                     "num_emitted starts at 0 from the second row",
                     meta.query_advice(fse_decoder.num_emitted, Rotation::next()),
                 );
@@ -2060,24 +2036,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             },
         );
         meta.create_gate(
-            "DecompressionCircuit: ZstdBlockHuffmanCode (other rows)",
-            |meta| {
-                let mut cb = BaseConstraintBuilder::default();
-
-                cb.require_boolean(
-                    "is_emit only transitions from 0 -> 1",
-                    meta.query_advice(fse_decoder.is_emit, Rotation::cur())
-                        - meta.query_advice(fse_decoder.is_emit, Rotation::prev()),
-                );
-
-                cb.gate(and::expr([
-                    meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
-                ]))
-            },
-        );
-        meta.create_gate(
             "DecompressionCircuit: ZstdBlockHuffmanCode (wherever we emit a symbol)",
             |meta| {
                 let mut cb = BaseConstraintBuilder::default();
@@ -2103,7 +2061,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::prev())),
                 ]))
             },
         );
@@ -2263,7 +2222,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::prev())),
                 ]);
                 let start = meta.query_advice(bitstream_decoder.bit_index_start, Rotation::cur());
                 let end = meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur());
@@ -2288,7 +2248,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::prev())),
                 ]);
                 [
                     meta.query_advice(huffman_tree_config.huffman_tree_idx, Rotation::cur()),
