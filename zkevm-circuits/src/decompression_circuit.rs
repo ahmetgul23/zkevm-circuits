@@ -240,12 +240,45 @@ pub struct BitstreamDecoder<F> {
     /// Helper gadget to know if the bitstring was contained in a single byte. We compare
     /// bit_index_end with 8 and if bit_index_end < 8 then the bitstring is contained. Otherwise it
     /// spans over two bytes.
-    bitstream_contained: LtConfig<F, 1>,
+    bitstring_contained: ComparatorConfig<F, 1>,
     /// The accumulated binary value of the bitstring.
     bit_value: Column<Advice>,
     /// The symbol that this bitstring decodes to. We are using this for decoding using FSE table
     /// or a Huffman Tree. So this symbol represents the decoded value that the bitstring maps to.
     decoded_symbol: Column<Advice>,
+}
+
+impl<F: Field> BitstreamDecoder<F> {
+    fn is_contained(
+        &self,
+        meta: &mut VirtualCells<F>,
+        rotation: Option<Rotation>,
+    ) -> Expression<F> {
+        let (lt, eq) = self.bitstring_contained.expr(meta, rotation);
+        sum::expr([lt, eq])
+    }
+
+    fn is_strictly_contained(
+        &self,
+        meta: &mut VirtualCells<F>,
+        rotation: Option<Rotation>,
+    ) -> Expression<F> {
+        let (lt, _eq) = self.bitstring_contained.expr(meta, rotation);
+        lt
+    }
+
+    fn is_byte_aligned(
+        &self,
+        meta: &mut VirtualCells<F>,
+        rotation: Option<Rotation>,
+    ) -> Expression<F> {
+        let (_lt, eq) = self.bitstring_contained.expr(meta, rotation);
+        eq
+    }
+
+    fn is_spanned(&self, meta: &mut VirtualCells<F>, rotation: Option<Rotation>) -> Expression<F> {
+        not::expr(self.is_contained(meta, rotation))
+    }
 }
 
 /// Fields related to application of the FSE table.
@@ -441,11 +474,11 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             BitstreamDecoder {
                 bit_index_start: meta.advice_column(),
                 bit_index_end,
-                bitstream_contained: LtChip::configure(
+                bitstring_contained: ComparatorChip::configure(
                     meta,
                     |meta| meta.query_fixed(q_enable, Rotation::cur()),
                     |meta| meta.query_advice(bit_index_end, Rotation::cur()),
-                    |_| 8.expr(),
+                    |_| 7.expr(),
                     range256.into(),
                 ),
                 bit_value: meta.advice_column(),
@@ -1661,9 +1694,14 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 // table size) of the table. So the first bitstring that's decoded starts from
                 // bit_index 4 (considering that it is 0-indexed).
                 cb.require_equal(
-                    "bit_index_start of the first bitstring",
+                    "accuracy log read from bits [0, 4)",
                     meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
-                    4.expr(),
+                    0.expr(),
+                );
+                cb.require_equal(
+                    "accuracy log read from bits [0, 4)",
+                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::next()),
+                    3.expr(),
                 );
 
                 // At every row, a new symbol is decoded. This symbol stands for the weight in the
@@ -1685,21 +1723,16 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
 
                 // Check that the decoded accuracy log is correct.
-                let accuracy_log = meta.query_advice(value_bits[0], Rotation::next())
-                    + meta.query_advice(value_bits[1], Rotation::next()) * 2.expr()
-                    + meta.query_advice(value_bits[2], Rotation::next()) * 4.expr()
-                    + meta.query_advice(value_bits[3], Rotation::next()) * 8.expr()
-                    + 5.expr();
                 cb.require_equal(
                     "accuracy log check",
                     meta.query_advice(huffman_tree_config.fse_table_al, Rotation::next()),
-                    accuracy_log,
+                    meta.query_advice(bitstream_decoder.bit_value, Rotation::next()) + 5.expr(),
                 );
 
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
                 ]))
             },
         );
@@ -1719,8 +1752,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 // contribute to the accuracy log of the FSE table.
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
                 ]);
                 [
                     meta.query_advice(huffman_tree_config.fse_table_al, Rotation::next()),
@@ -1762,32 +1795,10 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     );
                 });
 
-                // The next bitstring to be decoded should start right after the current bitstring
-                // ends, i.e. bit_index_start' == bit_index_end + 1.
-                //
-                // However, we have 0 <= bit_index_end < 16. So we want to check:
-                // - bit_index_start' == (bit_index_end % 8) + 1.
-                let bit_index_end =
-                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur());
-                let bit_index_end_mod8 = select::expr(
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
-                    bit_index_end.expr(),
-                    bit_index_end - 8.expr(),
-                );
-                cb.require_equal(
-                    "start of next bitstring is right after the end of the current",
-                    meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
-                    bit_index_end_mod8 + 1.expr(),
-                );
-
-                // The check that bit_index_end >= bit_index_start is indirectly verified through
-                // the lookup to the HuffmanCodesBitstringAccumulationTable, since the bit_index in
-                // that table is a fixed column.
-
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                 ]))
             },
         );
@@ -1801,9 +1812,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_contained(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -1833,9 +1844,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_contained(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -1864,9 +1875,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
-                    not::expr(bitstream_decoder.bitstream_contained.is_lt(meta, None)),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_spanned(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -1898,9 +1909,9 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
-                    not::expr(bitstream_decoder.bitstream_contained.is_lt(meta, None)),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_spanned(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -1931,8 +1942,8 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 );
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                 ]);
                 // The FSE table reconstruction follows a variable bit packing. However we know the
                 // start and end bit index for the bitstring that was read. We read a value in the
@@ -1991,102 +2002,43 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             |meta| {
                 let mut cb = BaseConstraintBuilder::default();
 
+                // - The first row of the HuffmanCode tag is the leading 0s and sentinel bit.
+                // - The second row of the HuffmanCode tag is the reading of AL number of bits from
+                // the bitstream to find the initial state in the FSE table.
+                // - Only from the third row onwards, do we start emitting symbols (weights).
+
                 cb.require_zero(
                     "is_emit == false on the first row",
                     meta.query_advice(fse_decoder.is_emit, Rotation::cur()),
                 );
                 cb.require_zero(
-                    "num_emitted starts at 0",
-                    meta.query_advice(fse_decoder.num_emitted, Rotation::cur()),
-                );
-
-                // We ignore leading 0s and a sentinel 1 bit at the start of this tag. We have 2
-                // cases here:
-                //
-                // 1. We encounter 7 leading 0s and 1 sentinel bit: bitstream decoding starts from
-                //    the next byte and ``bit_index_start == 0`` on the next byte.
-                // 2. We encounter k leading 0s and 1 sentinel bit, where k < 6: bitstream decoding
-                //    starts at the current byte. ``bit_index_start == k + 1``.
-                cb.condition(
-                    not::expr(meta.query_advice(fse_decoder.is_emit, Rotation::next())),
-                    |cb| {
-                        // If the next row also does not emit a symbol, we have encountered 7
-                        // leading 0s and 1 sentinel bit. i.e. value_byte == 0b_00000001.
-                        cb.require_equal(
-                            "7 leading 0s and a sentinel bit",
-                            meta.query_advice(value_byte, Rotation::cur()),
-                            1.expr(),
-                        );
-                        cb.require_equal(
-                            "byte_idx' == byte_idx + 1",
-                            meta.query_advice(byte_idx, Rotation::next()),
-                            meta.query_advice(byte_idx, Rotation::cur()) + 1.expr(),
-                        );
-                        cb.require_zero(
-                            "num_emitted stays 0",
-                            meta.query_advice(fse_decoder.num_emitted, Rotation::next()),
-                        );
-
-                        // This means we read from ``bit_index_start == 0`` on the next row. But
-                        // the first read in the Huffman code tag is to read ``accuracy_log``
-                        // number of bits to find the first state.
-                        //
-                        // After reading AL number of bits, the bit value is in fact the first
-                        // state we transition to.
-                        cb.require_zero(
-                            "read bitstream from the 1st bit",
-                            meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
-                        );
-                        cb.require_equal(
-                            "first read AL number of bits",
-                            meta.query_advice(huffman_tree_config.fse_table_al, Rotation::cur()), // accuracy log
-                            meta.query_advice(bitstream_decoder.bit_index_end, Rotation::next())
-                                + 1.expr(),
-                        );
-                        cb.require_equal(
-                            "AL number of bits read denote the first state",
-                            meta.query_advice(bitstream_decoder.decoded_symbol, Rotation::next()),
-                            meta.query_advice(fse_decoder.state, Rotation(2)),
-                        );
-
-                        // The row after the next should necessarily emit an FSE symbol.
-                        cb.require_equal(
-                            "is_emit == true",
-                            meta.query_advice(fse_decoder.is_emit, Rotation(2)),
-                            1.expr(),
-                        );
-                    },
-                );
-                cb.condition(
-                    // we emit a symbol on the next row, i.e. the current row is where we processed
-                    // the first AL bits.
+                    "is_emit == false on the second row",
                     meta.query_advice(fse_decoder.is_emit, Rotation::next()),
-                    |cb| {
-                        // in this case, the leading 0s and sentinel bit do not consume the entire
-                        // byte. Hence, the actual bitstream decoding must start at the same
-                        // byte_idx.
+                );
+                cb.require_equal(
+                    "is_emit == true from the third row onwards",
+                    meta.query_advice(fse_decoder.is_emit, Rotation(2)),
+                    1.expr(),
+                );
+                cb.require_zero(
+                    "num_emitted starts at 0 from the second row",
+                    meta.query_advice(fse_decoder.num_emitted, Rotation::next()),
+                );
 
-                        // We check that the bitstream consisting of the leading 0s and a sentinel
-                        // bit does in fact represent a bitstring of value 1. This is done by doing
-                        // lookups to the BitstringAccumulationTable.
-
-                        // Since this is the row where we start reading from bitstream, we read AL
-                        // number of bits to find the next state.
-                        let start =
-                            meta.query_advice(bitstream_decoder.bit_index_start, Rotation::cur());
-                        let end =
-                            meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur());
-                        cb.require_equal(
-                            "AL number of bits are read first",
-                            meta.query_advice(huffman_tree_config.fse_table_al, Rotation::cur()), // accuracy log
-                            end - start + 1.expr(), // num of bits read from bitstream
-                        );
-                        cb.require_equal(
-                            "AL number of bits read denote the first state",
-                            meta.query_advice(bitstream_decoder.decoded_symbol, Rotation::cur()),
-                            meta.query_advice(fse_decoder.state, Rotation::next()),
-                        );
-                    },
+                // On the second row we read AL number of bits.
+                cb.require_equal(
+                    "AL number of bits read on the second row",
+                    meta.query_advice(huffman_tree_config.fse_table_al, Rotation::cur()),
+                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::next())
+                        - meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next())
+                        + 1.expr(),
+                );
+                // Whatever bitstring we read, is also the initial state in the FSE table, where we
+                // start applying the FSE table.
+                cb.require_equal(
+                    "init state of FSE table",
+                    meta.query_advice(bitstream_decoder.bit_value, Rotation::next()),
+                    meta.query_advice(fse_decoder.state, Rotation(2)),
                 );
 
                 let lstream_kind = meta.query_advice(lstream_config.lstream_kind, Rotation::cur());
@@ -2140,25 +2092,11 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let is_last_row = meta.query_advice(tag_gadget.is_tag_change, Rotation::next());
                 let baseline = meta.query_advice(fse_decoder.baseline, Rotation::cur()); // baseline at state
                 let bit_value = meta.query_advice(bitstream_decoder.bit_value, Rotation::cur()); // bits read
-                cb.condition(not::expr(is_last_row.expr()), |cb| {
+                cb.condition(not::expr(is_last_row), |cb| {
                     cb.require_equal(
                         "state' == baseline(state) + bit_value",
                         meta.query_advice(fse_decoder.state, Rotation::next()),
                         baseline + bit_value,
-                    );
-                });
-
-                // If we are on the last row, the bitstream decoding ends here, i.e the
-                // bit_index_end for this bitstring should be the last bit.
-                cb.condition(is_last_row, |cb| {
-                    cb.require_equal(
-                        "last bitstring ends at the last bit",
-                        meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur()),
-                        select::expr(
-                            bitstream_decoder.bitstream_contained.is_lt(meta, None),
-                            7.expr(),
-                            15.expr(),
-                        ),
                     );
                 });
 
@@ -2167,66 +2105,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
                     meta.query_advice(fse_decoder.is_emit, Rotation::cur()),
                 ]))
-            },
-        );
-        meta.lookup_any(
-            "DecompressionCircuit: ZstdBlockHuffmanCode (leading 0s and sentinel bit start)",
-            |meta| {
-                let huffman_byte_offset =
-                    meta.query_advice(huffman_tree_config.huffman_tree_idx, Rotation::cur());
-                let condition = and::expr([
-                    meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
-                ]);
-                [
-                    huffman_byte_offset,                                       // huffman ID
-                    meta.query_advice(byte_idx, Rotation::cur()),              // byte index
-                    meta.query_advice(value_byte, Rotation::cur()),            // byte value
-                    1.expr(),                                                  // bitstring value
-                    1.expr(), // bitstring length accumulator, starts at 1
-                    0.expr(), // bit index start
-                    1.expr(), // denotes that this bit index is a part of the bitstring
-                    1.expr(), // denotes that this bit index is a part of the bitstring
-                    meta.query_advice(tag_gadget.is_reverse, Rotation::cur()), // is reverse
-                ]
-                .into_iter()
-                .zip(bs_acc_table.table_exprs_contained(meta))
-                .map(|(value, table)| (condition.expr() * value, table))
-                .collect()
-            },
-        );
-        meta.lookup_any(
-            "DecompressionCircuit: ZstdBlockHuffmanCode (leading 0s and sentinel bit end)",
-            |meta| {
-                // the leading 0s and sentinel bit is ``end + 1`` bits long. The first bitstream is
-                // read from the current row as well, and it starts at ``bit_index_start``.
-                let end = meta.query_advice(bitstream_decoder.bit_index_start, Rotation::cur())
-                    - 1.expr();
-                let huffman_byte_offset =
-                    meta.query_advice(huffman_tree_config.huffman_tree_idx, Rotation::cur());
-                let condition = and::expr([
-                    meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
-                ]);
-                [
-                    huffman_byte_offset,                                       // huffman ID
-                    meta.query_advice(byte_idx, Rotation::cur()),              // byte index
-                    meta.query_advice(value_byte, Rotation::cur()),            // byte value
-                    1.expr(),                                                  // bitstring value
-                    end.expr() + 1.expr(),                                     // bitstring length
-                    end.expr(),                                                // bit index at end
-                    1.expr(),                                                  // from start
-                    1.expr(),                                                  // to end
-                    meta.query_advice(tag_gadget.is_reverse, Rotation::cur()), // is reverse
-                ]
-                .into_iter()
-                .zip(bs_acc_table.table_exprs_contained(meta))
-                .map(|(value, table)| (condition.expr() * value, table))
-                .collect()
             },
         );
         meta.lookup_any(
@@ -2240,8 +2118,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
+                    bitstream_decoder.is_contained(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2272,8 +2149,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
+                    bitstream_decoder.is_contained(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2303,8 +2179,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    not::expr(bitstream_decoder.bitstream_contained.is_lt(meta, None)),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
+                    bitstream_decoder.is_spanned(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2337,8 +2212,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
-                    not::expr(bitstream_decoder.bitstream_contained.is_lt(meta, None)),
-                    meta.query_advice(fse_decoder.is_emit, Rotation::next()),
+                    bitstream_decoder.is_spanned(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2604,10 +2478,16 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                     meta.query_advice(lstream_config.lstream, Rotation::prev()),
                 );
 
+                cb.require_equal(
+                    "decoded byte is the decoded symbol",
+                    meta.query_advice(decoded_byte, Rotation::cur()),
+                    meta.query_advice(bitstream_decoder.decoded_symbol, Rotation::cur()),
+                );
+
                 cb.gate(and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                     meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
+                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
                 ]))
             },
         );
@@ -2687,64 +2567,6 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             },
         );
         meta.lookup_any(
-            "DecompressionCircuit: ZstdBlockLstream (leading 0s and sentinel bit start)",
-            |meta| {
-                let huffman_byte_offset =
-                    meta.query_advice(huffman_tree_config.huffman_tree_idx, Rotation::cur());
-                let condition = and::expr([
-                    meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
-                ]);
-                [
-                    huffman_byte_offset,                                       // huffman ID
-                    meta.query_advice(byte_idx, Rotation::cur()),              // byte index
-                    meta.query_advice(value_byte, Rotation::cur()),            // byte value
-                    1.expr(),                                                  // bitstring value
-                    1.expr(), // bitstring length accumulator, starts at 1
-                    0.expr(), // bit index start
-                    1.expr(), // denotes that this bit index is a part of the bitstring
-                    1.expr(), // denotes that this bit index is a part of the bitstring
-                    meta.query_advice(tag_gadget.is_reverse, Rotation::cur()), // is reverse
-                ]
-                .into_iter()
-                .zip(bs_acc_table.table_exprs_contained(meta))
-                .map(|(value, table)| (condition.expr() * value, table))
-                .collect()
-            },
-        );
-        meta.lookup_any(
-            "DecompressionCircuit: ZstdBlockLstream (leading 0s and sentinel bit end)",
-            |meta| {
-                // the leading 0s and sentinel bit is ``end + 1`` bits long. The first bitstream is
-                // read from the current row as well, and it starts at ``bit_index_start``.
-                let end = meta.query_advice(bitstream_decoder.bit_index_start, Rotation::cur())
-                    - 1.expr();
-                let huffman_byte_offset =
-                    meta.query_advice(huffman_tree_config.huffman_tree_idx, Rotation::cur());
-                let condition = and::expr([
-                    meta.query_fixed(q_enable, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
-                    meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
-                ]);
-                [
-                    huffman_byte_offset,                                       // huffman ID
-                    meta.query_advice(byte_idx, Rotation::cur()),              // byte index
-                    meta.query_advice(value_byte, Rotation::cur()),            // byte value
-                    1.expr(),                                                  // bitstring value
-                    end.expr() + 1.expr(),                                     // bitstring length
-                    end.expr(),                                                // bit index at end
-                    1.expr(),                                                  // from start
-                    1.expr(),                                                  // to end
-                    meta.query_advice(tag_gadget.is_reverse, Rotation::cur()), // is reverse
-                ]
-                .into_iter()
-                .zip(bs_acc_table.table_exprs_contained(meta))
-                .map(|(value, table)| (condition.expr() * value, table))
-                .collect()
-            },
-        );
-        meta.lookup_any(
             "DecompressionCircuit: ZstdBlockLstream (contained bitstream start)",
             |meta| {
                 let (huffman_byte_offset, start, bit_value) = (
@@ -2755,8 +2577,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_contained(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2787,8 +2608,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
-                    bitstream_decoder.bitstream_contained.is_lt(meta, None),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_contained(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2818,8 +2638,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
-                    not::expr(bitstream_decoder.bitstream_contained.is_lt(meta, None)),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_spanned(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2852,8 +2671,7 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
                 let condition = and::expr([
                     meta.query_fixed(q_enable, Rotation::cur()),
                     meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
-                    not::expr(bitstream_decoder.bitstream_contained.is_lt(meta, None)),
-                    not::expr(meta.query_advice(tag_gadget.is_tag_change, Rotation::cur())),
+                    bitstream_decoder.is_spanned(meta, None),
                 ]);
                 [
                     huffman_byte_offset,                                       // huffman ID
@@ -2875,8 +2693,102 @@ impl<F: Field> SubCircuitConfig<F> for DecompressionCircuitConfig<F> {
             },
         );
 
-        // TODO: account for leading 0s and sentinel: Lstream tag.
-        // TODO: for Lstream, decoded_symbol == decoded_byte on every row (except the first row)
+        meta.create_gate("DecompressionCircuit: bitstream reader", |meta| {
+            let mut cb = BaseConstraintBuilder::default();
+
+            // Note: for tag=FseCode, the first row of the bitstream read is in fact the second row
+            // of the tag. The first row of the tag is taken by the Huffman header descriptor.
+            let is_fse_code = meta.query_advice(tag_gadget.is_fse_code, Rotation::cur());
+            let is_first = sum::expr([
+                and::expr([
+                    is_fse_code,
+                    meta.query_advice(tag_gadget.is_tag_change, Rotation::prev()),
+                ]),
+                meta.query_advice(tag_gadget.is_tag_change, Rotation::cur()),
+            ]);
+            let is_last = meta.query_advice(tag_gadget.is_tag_change, Rotation::next());
+            let is_not_last = not::expr(is_last.expr());
+
+            // bitstream decoder starts at index=0.
+            cb.condition(is_first.expr(), |cb| {
+                cb.require_equal(
+                    "bitstream decoder starts at index=0",
+                    meta.query_advice(bitstream_decoder.bit_index_start, Rotation::cur()),
+                    0.expr(),
+                );
+            });
+
+            // bitstream decoder ends at index=7.
+            cb.condition(is_last, |cb| {
+                cb.require_equal(
+                    "bitstream decoder ends at index=7",
+                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur()),
+                    7.expr(),
+                );
+            });
+
+            // for all rows except the last.
+            let is_strictly_contained = and::expr([
+                is_not_last.expr(),
+                bitstream_decoder.is_strictly_contained(meta, None),
+            ]);
+            let is_byte_aligned = and::expr([
+                is_not_last.expr(),
+                bitstream_decoder.is_byte_aligned(meta, None),
+            ]);
+            let is_spanned =
+                and::expr([is_not_last.expr(), bitstream_decoder.is_spanned(meta, None)]);
+            // if bitstring is strictly contained.
+            cb.condition(is_strictly_contained, |cb| {
+                cb.require_equal(
+                    "strictly contained bitstring: bit_index_start",
+                    meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
+                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur()) + 1.expr(),
+                );
+                cb.require_equal(
+                    "strictly contained bitstring: byte_idx",
+                    meta.query_advice(byte_idx, Rotation::next()),
+                    meta.query_advice(byte_idx, Rotation::cur()),
+                );
+            });
+
+            // if bitstring is byte-aligned.
+            cb.condition(is_byte_aligned, |cb| {
+                cb.require_equal(
+                    "byte-aligned bitstring: bit_index_start",
+                    meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
+                    0.expr(),
+                );
+                cb.require_equal(
+                    "byte-aligned bitstring: byte_idx",
+                    meta.query_advice(byte_idx, Rotation::next()),
+                    meta.query_advice(byte_idx, Rotation::cur()) + 1.expr(),
+                );
+            });
+
+            // if bitstring is spanned.
+            cb.condition(is_spanned, |cb| {
+                cb.require_equal(
+                    "spanned bitstring: bit_index_start",
+                    meta.query_advice(bitstream_decoder.bit_index_start, Rotation::next()),
+                    meta.query_advice(bitstream_decoder.bit_index_end, Rotation::cur()) - 7.expr(),
+                );
+                cb.require_equal(
+                    "spanned bitstring: byte_idx",
+                    meta.query_advice(byte_idx, Rotation::next()),
+                    meta.query_advice(byte_idx, Rotation::cur()) + 1.expr(),
+                );
+            });
+
+            cb.gate(and::expr([
+                meta.query_fixed(q_enable, Rotation::cur()),
+                sum::expr([
+                    meta.query_advice(tag_gadget.is_fse_code, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_huffman_code, Rotation::cur()),
+                    meta.query_advice(tag_gadget.is_lstream, Rotation::cur()),
+                ]),
+            ]))
+        });
 
         debug_assert!(meta.degree() <= 9);
 
