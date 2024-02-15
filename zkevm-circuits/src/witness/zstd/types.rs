@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, io::Cursor};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Cursor,
+};
 
 use bitstream_io::{BitRead, BitReader, LittleEndian};
 use eth_types::Field;
@@ -135,6 +138,7 @@ impl From<usize> for FseSymbol {
     }
 }
 
+#[derive(Debug)]
 pub enum BlockType {
     RawBlock = 0,
     RleBlock,
@@ -172,11 +176,22 @@ impl From<LstreamNum> for usize {
         value as usize
     }
 }
+impl From<usize> for LstreamNum {
+    fn from(value: usize) -> LstreamNum {
+        match value {
+            0 => LstreamNum::Lstream1,
+            1 => LstreamNum::Lstream2,
+            2 => LstreamNum::Lstream3,
+            3 => LstreamNum::Lstream4,
+            _ => unreachable!("Wrong stream_idx"),
+        }
+    }
+}
 
 impl_expr!(LstreamNum);
 
 /// Various tags that we can decode from a zstd encoded data.
-#[derive(Clone, Copy, Debug, EnumIter)]
+#[derive(Clone, Copy, Debug, EnumIter, PartialEq, Eq, Hash)]
 pub enum ZstdTag {
     /// Null should not occur.
     Null = 0,
@@ -209,7 +224,8 @@ pub enum ZstdTag {
 }
 
 impl ZstdTag {
-    fn is_output(&self) -> bool {
+    /// Whether this tag produces an output or not.
+    pub fn is_output(&self) -> bool {
         match self {
             Self::Null => false,
             Self::FrameHeaderDescriptor => false,
@@ -218,18 +234,19 @@ impl ZstdTag {
             Self::RawBlockBytes => true,
             Self::RleBlockBytes => true,
             Self::ZstdBlockLiteralsHeader => false,
-            Self::ZstdBlockLiteralsRawBytes => true,
-            Self::ZstdBlockLiteralsRleBytes => true,
+            Self::ZstdBlockLiteralsRawBytes => false,
+            Self::ZstdBlockLiteralsRleBytes => false,
             Self::ZstdBlockFseCode => false,
             Self::ZstdBlockHuffmanCode => false,
             Self::ZstdBlockJumpTable => false,
-            Self::ZstdBlockLstream => true,
+            Self::ZstdBlockLstream => false,
             Self::ZstdBlockSequenceHeader => false,
             // TODO: more tags
         }
     }
 
-    fn is_block(&self) -> bool {
+    /// Whether this tag is a part of block or not.
+    pub fn is_block(&self) -> bool {
         match self {
             Self::Null => false,
             Self::FrameHeaderDescriptor => false,
@@ -249,7 +266,8 @@ impl ZstdTag {
         }
     }
 
-    fn is_reverse(&self) -> bool {
+    /// Whether this tag is processed in back-to-front order.
+    pub fn is_reverse(&self) -> bool {
         match self {
             Self::Null => false,
             Self::FrameHeaderDescriptor => false,
@@ -303,10 +321,15 @@ impl ToString for ZstdTag {
 pub struct ZstdState<F> {
     pub tag: ZstdTag,
     pub tag_next: ZstdTag,
+    pub max_tag_len: u64,
     pub tag_len: u64,
     pub tag_idx: u64,
     pub tag_value: Value<F>,
     pub tag_value_acc: Value<F>,
+    pub is_tag_change: bool,
+    // Unlike tag_value, tag_rlc only uses challenge as multiplier
+    pub tag_rlc: Value<F>,
+    pub tag_rlc_acc: Value<F>,
 }
 
 impl<F: Field> Default for ZstdState<F> {
@@ -314,15 +337,19 @@ impl<F: Field> Default for ZstdState<F> {
         Self {
             tag: ZstdTag::Null,
             tag_next: ZstdTag::FrameHeaderDescriptor,
+            max_tag_len: 0,
             tag_len: 0,
             tag_idx: 0,
             tag_value: Value::known(F::zero()),
             tag_value_acc: Value::known(F::zero()),
+            is_tag_change: false,
+            tag_rlc: Value::known(F::zero()),
+            tag_rlc_acc: Value::known(F::zero()),
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EncodedData<F> {
     pub byte_idx: u64,
     pub encoded_len: u64,
@@ -341,6 +368,22 @@ impl<F: Field> EncodedData<F> {
     }
 }
 
+impl<F: Field> Default for EncodedData<F> {
+    fn default() -> Self {
+        Self {
+            byte_idx: 0,
+            encoded_len: 0,
+            value_byte: 0,
+            reverse: false,
+            reverse_idx: 0,
+            reverse_len: 0,
+            aux_1: Value::known(F::zero()),
+            aux_2: Value::known(F::zero()),
+            value_rlc: Value::known(F::zero()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct DecodedData<F> {
     pub decoded_len: u64,
@@ -354,6 +397,7 @@ pub struct DecodedData<F> {
 pub struct HuffmanData {
     pub byte_offset: u64,
     pub bit_value: u8,
+    pub stream_idx: usize,
     pub k: (u8, u8),
 }
 
@@ -370,6 +414,10 @@ pub struct HuffmanCodesData {
 
 /// Denotes the tuple (max_bitstring_len, Map<symbol, (weight, bit_value)>).
 type ParsedCanonicalHuffmanCode = (u64, BTreeMap<u64, (u64, u64)>);
+/// A representation indexed by bitstring (String) as key for decoding symbols specifically.
+/// Huffman code decoding ensures prefix code, thus the explicit articulation of bitstring is
+/// necessary.
+type ParsedCanonicalHuffmanCodeBitstringMap = (u64, HashMap<String, u64>);
 
 impl HuffmanCodesData {
     /// Reconstruct the bitstrings for each symbol based on the canonical Huffman code weights. The
@@ -425,6 +473,57 @@ impl HuffmanCodesData {
 
         (max_bitstring_len, sym_to_tuple)
     }
+
+    /// parse bit string map
+    pub fn parse_bitstring_map(&self) -> ParsedCanonicalHuffmanCodeBitstringMap {
+        let mut weights: Vec<usize> = self.weights.iter().map(|w| *w as usize).collect();
+        let sum_weights: usize = weights
+            .iter()
+            .filter_map(|&w| if w > 0 { Some(1 << (w - 1)) } else { None })
+            .sum();
+
+        let nearest_pow_2: usize = 1 << (sum_weights - 1).next_power_of_two().trailing_zeros();
+        weights.push(f64::log2((nearest_pow_2 - sum_weights) as f64).ceil() as usize + 1);
+        let max_number_of_bits = nearest_pow_2.trailing_zeros() as usize;
+        let n = weights.len();
+
+        let bitstring_length: Vec<usize> = weights
+            .iter()
+            .map(|&w| {
+                if w != 0 {
+                    max_number_of_bits - w + 1
+                } else {
+                    0
+                }
+            })
+            .collect();
+
+        let mut bitstring_map = HashMap::new();
+        let mut cur_bit_value = 0;
+
+        for bit_len in (1..=max_number_of_bits).rev() {
+            cur_bit_value += 1;
+            cur_bit_value >>= 1;
+
+            for (sym, b_len) in bitstring_length.iter().enumerate().take(n) {
+                if *b_len == bit_len {
+                    bitstring_map.insert(
+                        format!("{:0width$b}", cur_bit_value, width = bit_len),
+                        sym as u64,
+                    );
+                    cur_bit_value += 1;
+                }
+            }
+        }
+
+        let max_bitstring_len = bitstring_map
+            .keys()
+            .map(|k| k.len())
+            .max()
+            .expect("Keys have maximum len");
+
+        (max_bitstring_len as u64, bitstring_map)
+    }
 }
 
 /// A single row in the FSE table.
@@ -440,6 +539,23 @@ pub struct FseTableRow {
     pub num_bits: u64,
     /// The symbol emitted by the FSE table at this state.
     pub symbol: u64,
+    /// During FSE table decoding, keep track of the number of symbol emitted
+    pub num_emitted: u64,
+    /// During FSE table decoding, keep track of accumulated states assigned
+    pub n_acc: u64,
+}
+
+// Used for tracking bit markers for non-byte-aligned bitstream decoding
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BitstreamReadRow {
+    /// Start of the bit location within a byte [0, 8)
+    pub bit_start_idx: usize,
+    /// End of the bit location within a byte (0, 16)
+    pub bit_end_idx: usize,
+    /// The value of the bitstring
+    pub bit_value: u64,
+    /// Whether 0 bit is read
+    pub is_zero_bit_read: bool,
 }
 
 /// Data for the FSE table's witness values.
@@ -467,6 +583,13 @@ pub struct FseAuxiliaryTableData {
     pub sym_to_states: BTreeMap<FseSymbol, Vec<FseTableRow>>,
 }
 
+/// Another form of Fse table that has state as key instead of the FseSymbol.
+/// In decoding, symbols are emitted from state-chaining.
+/// This representation makes it easy to look up decoded symbol from current state.   
+/// Map<state, (symbol, baseline, num_bits)>.
+type FseStateMapping = BTreeMap<u64, (u64, u64, u64)>;
+type ReconstructedFse = (usize, Vec<(u32, u64)>, FseAuxiliaryTableData);
+
 impl FseAuxiliaryTableData {
     #[allow(non_snake_case)]
     /// While we reconstruct an FSE table from a bitstream, we do not know before reconstruction
@@ -476,10 +599,11 @@ impl FseAuxiliaryTableData {
     /// with the reconstructed FSE table. After processing the entire bitstream to reconstruct the
     /// FSE table, if the read bitstream was not byte aligned, then we discard the 1..8 bits from
     /// the last byte that we read from.
-    pub fn reconstruct(src: &[u8], byte_offset: usize) -> std::io::Result<(usize, Self)> {
+    pub fn reconstruct(src: &[u8], byte_offset: usize) -> std::io::Result<ReconstructedFse> {
         // construct little-endian bit-reader.
         let data = src.iter().skip(byte_offset).cloned().collect::<Vec<u8>>();
         let mut reader = BitReader::endian(Cursor::new(&data), LittleEndian);
+        let mut bit_boundaries: Vec<(u32, u64)> = vec![];
 
         // number of bits read by the bit-reader from the bistream.
         let mut offset = 0;
@@ -488,6 +612,7 @@ impl FseAuxiliaryTableData {
             offset += 4;
             reader.read::<u8>(offset)? + 5
         };
+        bit_boundaries.push((offset, accuracy_log as u64 - 5));
         let table_size = 1 << accuracy_log;
 
         let mut sym_to_states = BTreeMap::new();
@@ -538,6 +663,8 @@ impl FseAuxiliaryTableData {
                         num_bits: nb,
                         baseline,
                         symbol: symbol.into(),
+                        num_emitted: 0,
+                        n_acc: 0,
                     })
                     .collect(),
             );
@@ -545,6 +672,7 @@ impl FseAuxiliaryTableData {
 
             // update the total number of bits read so far.
             offset += n_bits_read;
+            bit_boundaries.push((offset, value));
 
             // increment symbol.
             symbol = ((symbol as usize) + 1).into();
@@ -560,8 +688,18 @@ impl FseAuxiliaryTableData {
         // ignore any bits left to be read until byte-aligned.
         let t = (((offset as usize) - 1) / N_BITS_PER_BYTE) + 1;
 
+        // read the trailing section
+        if t * N_BITS_PER_BYTE > (offset as usize) {
+            let bits_remaining = t * N_BITS_PER_BYTE - offset as usize;
+            bit_boundaries.push((
+                offset + bits_remaining as u32,
+                reader.read::<u8>(bits_remaining as u32)? as u64,
+            ));
+        }
+
         Ok((
             t,
+            bit_boundaries,
             Self {
                 byte_offset: byte_offset as u64,
                 table_size,
@@ -569,18 +707,44 @@ impl FseAuxiliaryTableData {
             },
         ))
     }
+
+    /// Convert an FseAuxiliaryTableData into a state-mapped representation.
+    /// This makes it easier to lookup state-chaining during decoding.
+    pub fn parse_state_table(&self) -> FseStateMapping {
+        let rows: Vec<FseTableRow> = self
+            .sym_to_states
+            .values()
+            .flat_map(|v| v.clone())
+            .collect();
+        let mut state_table: FseStateMapping = BTreeMap::new();
+
+        for row in rows {
+            state_table.insert(row.state, (row.symbol, row.baseline, row.num_bits));
+        }
+
+        state_table
+    }
 }
 
 #[derive(Clone, Debug)]
+/// Row witness value for decompression circuit
 pub struct ZstdWitnessRow<F> {
+    /// Current decoding state during Zstd decompression
     pub state: ZstdState<F>,
+    /// Data on compressed data
     pub encoded_data: EncodedData<F>,
+    /// Data on decompressed data
     pub decoded_data: DecodedData<F>,
+    /// Huffman code bitstring marker that devides bitstream into symbol segments
     pub huffman_data: HuffmanData,
+    /// Fse decoding state transition data
     pub fse_data: FseTableRow,
+    /// Bitstream reader
+    pub bitstream_read_data: BitstreamReadRow,
 }
 
 impl<F: Field> ZstdWitnessRow<F> {
+    /// Construct the first row of witnesses for decompression circuit
     pub fn init(src_len: usize) -> Self {
         Self {
             state: ZstdState::default(),
@@ -591,6 +755,7 @@ impl<F: Field> ZstdWitnessRow<F> {
             decoded_data: DecodedData::default(),
             huffman_data: HuffmanData::default(),
             fse_data: FseTableRow::default(),
+            bitstream_read_data: BitstreamReadRow::default(),
         }
     }
 }
@@ -607,10 +772,12 @@ mod tests {
         // other bytes are garbage (for the purpose of this test case), and we want to make
         // sure FSE reconstruction ignores them.
         let src = vec![0xff, 0xff, 0xff, 0x30, 0x6f, 0x9b, 0x03, 0xff, 0xff, 0xff];
-        let (n_bytes, table) = FseAuxiliaryTableData::reconstruct(&src, 3)?;
+
+        let (n_bytes, _bit_boundaries, table) = FseAuxiliaryTableData::reconstruct(&src, 3)?;
 
         // TODO: assert equality for the entire table.
         // for now only comparing state/baseline/nb for S1, i.e. weight == 1.
+
         assert_eq!(n_bytes, 4);
         assert_eq!(
             table.sym_to_states.get(&FseSymbol::S1).cloned().unwrap(),
@@ -630,9 +797,104 @@ mod tests {
                 symbol: 1,
                 baseline,
                 num_bits,
+                num_emitted: 0,
+                n_acc: 0,
             })
             .collect::<Vec<FseTableRow>>(),
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_huffman_bitstring_reconstruction() -> std::io::Result<()> {
+        let weights = vec![
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 3, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+            1, 2, 0, 0, 0, 2, 0, 1, 1, 1, 1, 1, 0, 0, 1, 2, 1, 0, 1, 1, 1, 2, 0, 0, 1, 1, 1, 1, 0,
+            1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 5, 3, 3, 3, 6, 3, 2, 4, 4, 0, 1, 4, 4, 5, 5, 2, 0, 4, 4,
+            5, 3, 1, 3, 1, 3,
+        ]
+        .into_iter()
+        .map(FseSymbol::from)
+        .collect::<Vec<FseSymbol>>();
+
+        let huffman_codes_data = HuffmanCodesData {
+            byte_offset: 0,
+            weights,
+        };
+
+        let (max_bitstring_len, bitstring_map) = huffman_codes_data.parse_bitstring_map();
+
+        let expected_bitstrings: [(&str, u64); 53] = [
+            ("01001", 10),
+            ("110", 32),
+            ("00000000", 33),
+            ("0001100", 39),
+            ("001010", 44),
+            ("0001101", 46),
+            ("00000001", 50),
+            ("00000010", 58),
+            ("0001110", 59),
+            ("0001111", 63),
+            ("00000011", 65),
+            ("00000100", 66),
+            ("00000101", 67),
+            ("00000110", 68),
+            ("00000111", 69),
+            ("00001000", 72),
+            ("0010000", 73),
+            ("00001001", 74),
+            ("00001010", 76),
+            ("00001011", 77),
+            ("00001100", 78),
+            ("0010001", 79),
+            ("00001101", 82),
+            ("00001110", 83),
+            ("00001111", 84),
+            ("00010000", 85),
+            ("00010001", 87),
+            ("00010010", 91),
+            ("00010011", 93),
+            ("1000", 97),
+            ("001011", 98),
+            ("001100", 99),
+            ("001101", 100),
+            ("111", 101),
+            ("001110", 102),
+            ("0010010", 103),
+            ("01010", 104),
+            ("01011", 105),
+            ("00010100", 107),
+            ("01100", 108),
+            ("01101", 109),
+            ("1001", 110),
+            ("1010", 111),
+            ("0010011", 112),
+            ("01110", 114),
+            ("01111", 115),
+            ("1011", 116),
+            ("001111", 117),
+            ("00010101", 118),
+            ("010000", 119),
+            ("00010110", 120),
+            ("010001", 121),
+            ("00010111", 122),
+        ];
+
+        assert_eq!(max_bitstring_len, 8, "max bitstring len is 8");
+        assert_eq!(
+            expected_bitstrings.len(),
+            bitstring_map.len(),
+            "# of bitstring is the same"
+        );
+        for pair in expected_bitstrings {
+            assert_eq!(
+                *bitstring_map.get(pair.0).unwrap(),
+                pair.1,
+                "bitstring mapping is correct"
+            );
+        }
 
         Ok(())
     }

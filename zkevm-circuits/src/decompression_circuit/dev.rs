@@ -10,7 +10,8 @@ use crate::{
     },
     table::{
         decompression::{
-            BitstringAccumulationTable, FseTable, HuffmanCodesTable, LiteralsHeaderTable,
+            BitstringAccumulationTable, DecodedLiteralsTable, FseTable, HuffmanCodesTable,
+            LiteralsHeaderTable,
         },
         BitwiseOpTable, KeccakTable, Pow2Table, PowOfRandTable, RangeTable,
     },
@@ -19,6 +20,7 @@ use crate::{
 
 impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
     type Config = (DecompressionCircuitConfig<F>, Challenges);
+
     type FloorPlanner = SimpleFloorPlanner;
     #[cfg(feature = "circuit-params")]
     type Params = ();
@@ -51,6 +53,8 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
             range16,
             range64,
         );
+        let decoded_literals_table =
+            DecodedLiteralsTable::construct(meta, challenge_exprs.clone(), range256);
 
         let config = DecompressionCircuitConfig::new(
             meta,
@@ -60,7 +64,12 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
                 huffman_codes_table,
                 bs_acc_table,
                 literals_header_table,
+                decoded_literals_table,
+                bitwise_op_table,
+                range4,
                 range8,
+                range16,
+                range64,
                 range128,
                 range256,
                 pow2_table,
@@ -78,6 +87,20 @@ impl<F: Field> Circuit<F> for DecompressionCircuit<F> {
         mut layouter: impl Layouter<F>,
     ) -> Result<(), Error> {
         let challenges = &config.1.values(&layouter);
+
+        config.0.bitwise_op_table.load(&mut layouter)?;
+        config.0.range4.load(&mut layouter)?;
+        config.0.range8.load(&mut layouter)?;
+        config.0.range16.load(&mut layouter)?;
+        config.0.range64.load(&mut layouter)?;
+        config.0.range128.load(&mut layouter)?;
+        config.0.range256.load(&mut layouter)?;
+        config.0.tag_rom_table.load(&mut layouter)?;
+        config.0.pow_rand_table.assign(&mut layouter, challenges)?;
+        config.0.block_type_rom_table.load(&mut layouter)?;
+        config.0.pow2_table.load(&mut layouter)?;
+        config.0.literals_header_rom_table.load(&mut layouter)?;
+
         self.synthesize_sub(&config.0, challenges, &mut layouter)
     }
 }
