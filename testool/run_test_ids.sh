@@ -5,4 +5,4 @@ cd /home/ubuntu/zkevm-circuits/testool
 export RUST_BACKTRACE=1
 export RUST_LOG=debug
 
-cargo run --features "parallel_syn scroll"  --release -- --suite nightly --circuits sc --test-ids test_ids.txt --report
+/home/ubuntu/.cargo/bin/cargo run --features "parallel_syn scroll"  --release -- --suite nightly --circuits sc --test-ids test_ids.txt --report
