@@ -451,20 +451,14 @@ impl<F: Field> ExecutionConfig<F> {
                 .chain(first_step_check)
                 .chain(last_step_check)
         });
-
-        meta.create_gate("q_step", |meta| {
+        meta.create_gate("q_step_first", |meta| {
             let q_usable = meta.query_fixed(q_usable, Rotation::cur());
             let q_step_first = meta.query_selector(q_step_first);
-            let q_step_last = meta.query_selector(q_step_last);
             let q_step = meta.query_advice(q_step, Rotation::cur());
-            let num_rows_left_cur = meta.query_advice(num_rows_until_next_step, Rotation::cur());
-            let num_rows_left_next = meta.query_advice(num_rows_until_next_step, Rotation::next());
-            let num_rows_left_inverse = meta.query_advice(num_rows_inv, Rotation::cur());
-
             let mut cb = BaseConstraintBuilder::default();
             // q_step needs to be enabled on the first row
             // rw_counter starts at 1
-            cb.condition(q_step_first, |cb| {
+            cb.condition(q_usable, |cb| {
                 cb.require_equal("q_step == 1", q_step.clone(), 1.expr());
                 cb.require_equal(
                     "rw_counter is initialized to be 1",
@@ -472,6 +466,27 @@ impl<F: Field> ExecutionConfig<F> {
                     1.expr(),
                 )
             });
+            cb.gate(q_step_first)
+        });
+        meta.create_gate("q_step_last", |meta| {
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
+            let q_step_last = meta.query_selector(q_step_last);
+            let q_step = meta.query_advice(q_step, Rotation::cur());
+            let mut cb = BaseConstraintBuilder::default();
+            // q_step needs to be enabled on the last row
+            cb.condition(q_usable, |cb| {
+                cb.require_equal("q_step == 1", q_step.clone(), 1.expr());
+            });
+            cb.gate(q_step_last)
+        });
+        meta.create_gate("q_step", |meta| {
+            let q_usable = meta.query_fixed(q_usable, Rotation::cur());
+            let q_step = meta.query_advice(q_step, Rotation::cur());
+            let num_rows_left_cur = meta.query_advice(num_rows_until_next_step, Rotation::cur());
+            let num_rows_left_next = meta.query_advice(num_rows_until_next_step, Rotation::next());
+            let num_rows_left_inverse = meta.query_advice(num_rows_inv, Rotation::cur());
+
+            let mut cb = BaseConstraintBuilder::default();
             // For every step, is_create and is_root are boolean.
             cb.condition(q_step.clone(), |cb| {
                 cb.require_boolean(
@@ -480,12 +495,8 @@ impl<F: Field> ExecutionConfig<F> {
                 );
                 cb.require_boolean("step.is_root is boolean", step_curr.state.is_root.expr());
             });
-            // q_step needs to be enabled on the last row
-            cb.condition(q_step_last, |cb| {
-                cb.require_equal("q_step == 1", q_step.clone(), 1.expr());
-            });
             // Except when step is enabled, the step counter needs to decrease by 1
-            cb.condition(1.expr() - q_step.clone(), |cb| {
+            cb.condition(not::expr(q_step.clone()), |cb| {
                 cb.require_equal(
                     "num_rows_left_cur := num_rows_left_next + 1",
                     num_rows_left_cur.clone(),

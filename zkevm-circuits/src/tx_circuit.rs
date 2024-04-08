@@ -948,18 +948,33 @@ impl<F: Field> SubCircuitConfig<F> for TxCircuitConfig<F> {
         meta.create_gate("lookup into Keccak table condition", |meta| {
             let mut cb = BaseConstraintBuilder::default();
 
-            let is_tag_sign_or_hash = sum::expr([
+            let is_tag_sign_or_l1_hash = sum::expr([
                 and::expr([
                     is_sign_length(meta),
                     not::expr(meta.query_advice(is_l1_msg, Rotation::cur())),
                 ]),
-                is_hash_length(meta),
+                and::expr([
+                    is_hash_length(meta),
+                    meta.query_advice(is_l1_msg, Rotation::cur()),
+                ]),
             ]);
             cb.require_equal(
                 "condition",
-                is_tag_sign_or_hash,
+                is_tag_sign_or_l1_hash,
                 meta.query_advice(lookup_conditions[&LookupCondition::Keccak], Rotation::cur()),
             );
+
+            // For L2 tx hash, it should be assigned 0 (not included in Keccak lookup in this case)
+            let is_l2_hash = and::expr([
+                is_hash(meta),
+                not::expr(meta.query_advice(is_l1_msg, Rotation::cur())),
+            ]);
+            cb.condition(is_l2_hash, |cb| {
+                cb.require_zero(
+                    "L2 tx hash value is 0",
+                    meta.query_advice(tx_table.value, Rotation::cur()),
+                )
+            });
 
             cb.gate(meta.query_fixed(q_enable, Rotation::cur()))
         });
@@ -2508,7 +2523,7 @@ impl<F: Field> TxCircuitConfig<F> {
         // lookup Keccak table for tx sign data hash, i.e. the sighash that has to be
         // signed.
         // lookup Keccak table for tx hash too.
-        meta.lookup_any("Keccak table lookup for TxSign and TxHash", |meta| {
+        meta.lookup_any("Keccak table lookup for TxSign and L1 TxHash", |meta| {
             let enable = and::expr(vec![
                 meta.query_fixed(q_enable, Rotation::cur()),
                 meta.query_advice(lookup_conditions[&LookupCondition::Keccak], Rotation::cur()),
@@ -2596,7 +2611,11 @@ impl<F: Field> TxCircuitConfig<F> {
         let sign_hash = keccak256(tx.rlp_unsigned.as_slice());
         let hash = keccak256(tx.rlp_signed.as_slice());
         let sign_hash_rlc = rlc_be_bytes(&sign_hash, evm_word);
-        let hash_rlc = rlc_be_bytes(&hash, evm_word);
+        let hash_rlc = if tx.tx_type != L1Msg {
+            Value::known(F::zero())
+        } else {
+            rlc_be_bytes(&hash, evm_word)
+        };
         let mut supplemental_data: Vec<Value<F>> = vec![];
         let mut txbytes_hash_assignment: Option<AssignedCell<F, F>> = None;
         let mut tx_value_cells = vec![];
@@ -3074,10 +3093,10 @@ impl<F: Field> TxCircuitConfig<F> {
                 let is_tag_in_set = hash_set.into_iter().filter(|tag| tx_tag == *tag).count() == 1;
                 F::from((is_l1_msg && is_tag_in_set) as u64)
             });
-            // 6. lookup to Keccak table for tx_sign_hash and tx_hash
+            // 6. lookup to Keccak table for tx_sign_hash and l1 tx_hash
             conditions.insert(LookupCondition::Keccak, {
                 let case1 = (tx_tag == TxSignLength) && !is_l1_msg;
-                let case2 = tx_tag == TxHashLength;
+                let case2 = (tx_tag == TxHashLength) && is_l1_msg;
                 F::from((case1 || case2) as u64)
             });
 
